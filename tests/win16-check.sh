@@ -35,3 +35,10 @@ printf 'Win16 compile: cad_script (large model) PASS\n'
 # --- parts (large model) ---
 "$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_parts.obj" "$root/cad_parts.c"
 printf 'Win16 compile: cad_parts (large model) PASS\n'
+# --- features (large model; module and its test) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_features.obj" "$root/cad_features.c"
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/features_test.obj" "$root/tests/features_test.c"
+printf 'Win16 compile: cad_features + features_test (large model) PASS\n'
+# --- featureui (large model, Windows dialogs included via __WINDOWS__) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_featureui.obj" "$root/cad_featureui.c"
+printf 'Win16 compile: cad_featureui (large model) PASS\n'

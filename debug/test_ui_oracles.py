@@ -2,7 +2,7 @@
 import unittest
 from PIL import Image, ImageDraw, ImageFont
 from test_cad_ui import recognize, red_geometry, white_fraction
-from test_generic_ui import rendered_state
+from test_generic_ui import rendered_state, feature_state, STATE_MAGIC, FEATURE_MAGIC
 
 
 class OracleTests(unittest.TestCase):
@@ -44,6 +44,31 @@ class OracleTests(unittest.TestCase):
         assert state is not None
         self.assertEqual((state['vertices'], state['edges']), (2, 1))
         self.assertTrue(state['components'] and state['dirty'] and not state['shaded'])
+
+    def test_feature_strip_is_separate_from_the_state_strip(self):
+        image = Image.new('RGB', (640, 480), 'white')
+        pixels = image.load()
+        assert pixels is not None
+        def strip(row, magic, payload, constant):
+            checksum = (payload ^ (payload >> 8) ^ (payload >> 16) ^ constant) & 255
+            encoded = payload | (checksum << 24)
+            colors = list(magic) + [(255, 255, 255) if encoded & (1 << bit) else (0, 0, 0) for bit in range(32)]
+            for y in (row, row + 1):
+                for index, color in enumerate(colors):
+                    pixels[6 + index * 2, y] = color
+        # 2 features, 1 failed, sketch mode, X extent 200, bounds.
+        feature = 2 | (1 << 5) | (1 << 10) | (200 << 12) | (1 << 23)
+        strip(473, STATE_MAGIC, 8 | (12 << 9), 0xa7)
+        strip(475, FEATURE_MAGIC, feature, 0x5c)
+        state, features = rendered_state(image), feature_state(image)
+        assert state is not None and features is not None
+        self.assertEqual((state['vertices'], state['edges']), (8, 12))
+        self.assertEqual((features['features'], features['errors'], features['extent_x']), (2, 1, 200))
+        self.assertTrue(features['sketch_mode'] and features['bounds'] and not features['shaded'])
+        # The feature checksum constant differs: a state-style word is rejected.
+        strip(475, FEATURE_MAGIC, feature, 0xa7)
+        self.assertIsNone(feature_state(image))
+        self.assertIsNotNone(rendered_state(image))
 
     def test_dialog_occlusion_is_not_a_successful_edit(self):
         original = Image.new('RGB', (400, 300), 'black')

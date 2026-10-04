@@ -14,9 +14,34 @@ cross-compiled on Linux/WSL with Open Watcom and run in the
 - Versioned, CRC-checked `.CAD` documents with recoverable saves
 - DXF (R12) and OBJ wireframe export; third-angle orthographic drawing sheet
 - Demos: House, and a shaded/wireframe Boeing 747-400
+- Parametric part modeling (Inventor-style feature tree):
+  - **Sketch** tab / **Part** menu: *Start 2D Sketch* on XY, XZ or YZ with an offset
+    expression (enters sketch mode, turns the view to the plane, dims other geometry),
+    *Rectangle*, *Circle* (8..32 sides) and *Polygon* (`x,y;x,y;...`) profiles,
+    *Finish Sketch*
+  - **3D Model** tab: *Extrude* (sketch, profile ALL or number, distance, normal /
+    reverse / symmetric) and *Revolve* (axis u or v, 12..24 segments)
+  - Every dimension is an expression over Parameters (fx), e.g. `W/2 + 10`; features
+    regenerate after each feature edit, parameter change, unit change, undo and load,
+    so changing `W` resizes every extrusion that uses it
+  - Browser group **Part** at the top: features and profiles with health markers
+    `(!) message`, `(blocked)`, `(suppressed)`. Double-click/Enter edits (prefilled),
+    Del removes (refused with an explanation while another feature depends on it);
+    Part menu: Rename, Suppress/Unsuppress, Move Up/Down, Delete
+  - An edit that would introduce a new error is rejected and the dialog stays open
+  - Wireframe draws sketch curves blue and body edges black; *Shaded* fills feature
+    bodies with the same orthographic renderer as the 747; Zoom all, DXF/OBJ export
+    and the drawing sheet include body edges (within the 256/512 export limits; an
+    omission count is reported)
+  - Saved as a `[FEATURES]` section of the `.CAD` file (atomic load); feature edits
+    mark the document dirty but are not model undo steps — *Part > Undo Last Feature
+    Edit* reverts up to 4 of them
 
-Limits: 256 vertices, 512 edges, integer coordinates ±400. Geometry is a wireframe
-graph plus demo meshes; there is no solid kernel or parametric feature tree yet.
+Limits: 256 vertices, 512 edges, integer coordinates ±400. Features: 24 features,
+32 profiles (8 per sketch), regenerated output 1024 segments / 256 mesh vertices /
+512 faces; the whole document extension (parameters, constraints, components,
+features) must fit 16 KiB. Bodies are independent: no booleans, holes, fillets or
+hidden-line removal; there is no solid kernel.
 
 ## Build
 
@@ -57,7 +82,8 @@ a checksummed pixel strip that CAD.EXE draws in `/UITEST` mode.
 | Path | Purpose |
 |---|---|
 | `cad.c`, `cad.rc`, `cad_ui_ids.h` | Win16 front end |
-| `cad_*.c/h` | Portable C89 modules (model, documents, export, drawing, sketch, params, constraints, assembly, aircraft, mesh view, ViewCube) |
+| `cad_*.c/h` | Portable C89 modules (model, documents, export, drawing, sketch, params, constraints, assembly, features, aircraft, mesh view, ViewCube) |
+| `cad_featureui.c/h` | Feature-tree glue for CAD.EXE: storage, dialogs, browser rows, persistence |
 | `debug/` | Local PCjs harness, server and browser tests |
 | `tests/` | Host tests and Win16 compile checks |
 | `house.c`, `stars.c`, `wallgen.c` | Earlier experiments |

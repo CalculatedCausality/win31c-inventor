@@ -37,7 +37,7 @@ for p do
         cadflags="-q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -fr"
         "$WATCOM/binl64/wcc" $cadflags -we -fo=out/cad.obj cad.c
         for module in model create document sketch export drawing aircraft meshview viewcube \
-                params userparams constraints vconstraints script assembly parts; do
+                params userparams constraints vconstraints script assembly parts features featureui; do
             "$WATCOM/binl64/wcc" $cadflags "-fo=out/cad_$module.obj" "cad_$module.c"
         done
         "$WATCOM/binl64/wrc" -q -bt=windows -31 -r -fo=out/cad.res cad.rc

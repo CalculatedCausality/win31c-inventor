@@ -44,10 +44,35 @@ def status_text(image):
     return recognize(strip, line=True)
 
 
+STATE_MAGIC = ((255, 0, 255), (255, 255, 0), (0, 255, 255), (255, 0, 255))
+FEATURE_MAGIC = ((0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 255))
+
+
 def rendered_state(image):
     """Decode checksummed /UITEST pixels emitted after the actual GDI paint."""
+    low = telemetry_word(image, STATE_MAGIC, 0xa7)
+    if low is None:
+        return None
+    return {'vertices': low & 511, 'edges': (low >> 9) & 1023,
+            'units': (low >> 19) & 3, 'shaded': bool(low & (1 << 21)),
+            'dirty': bool(low & (1 << 22)),
+            'components': bool(low & (1 << 23))}
+
+
+def feature_state(image):
+    """Second /UITEST strip (cad_fui_telemetry): the part feature tree."""
+    low = telemetry_word(image, FEATURE_MAGIC, 0x5c)
+    if low is None:
+        return None
+    return {'features': low & 31, 'errors': (low >> 5) & 31,
+            'sketch_mode': bool(low & (1 << 10)), 'shaded': bool(low & (1 << 11)),
+            'extent_x': (low >> 12) & 1023, 'truncated': bool(low & (1 << 22)),
+            'bounds': bool(low & (1 << 23))}
+
+
+def telemetry_word(image, magic, constant):
+    """24-bit payload of a strip: 4 marker pixels then 32 bits, two rows high."""
     pixels = image.convert('RGB').load()
-    magic = ((255, 0, 255), (255, 255, 0), (0, 255, 255), (255, 0, 255))
     # VGA DAC channels are six-bit: requested 255 is rendered as 252.
     def same_color(actual, expected):
         return max(abs(a - b) for a, b in zip(actual, expected)) <= 5
@@ -68,13 +93,37 @@ def rendered_state(image):
                 if white:
                     encoded |= 1 << bit
             low = encoded & 0xffffff
-            if not valid or encoded >> 24 != ((low ^ (low >> 8) ^ (low >> 16) ^ 0xa7) & 255):
+            if not valid or encoded >> 24 != ((low ^ (low >> 8) ^ (low >> 16) ^ constant) & 255):
                 continue
-            return {'vertices': low & 511, 'edges': (low >> 9) & 1023,
-                    'units': (low >> 19) & 3, 'shaded': bool(low & (1 << 21)),
-                    'dirty': bool(low & (1 << 22)),
-                    'components': bool(low & (1 << 23))}
+            return low
     return None
+
+
+def geometry_box(image):
+    """Bounding box (width, height) of geometry-pen pixels in the viewport,
+    skipping the ViewCube corner; None if nothing is drawn."""
+    rgb = image.convert('RGB')
+    pixels = rgb.load()
+    xs, ys = [], []
+    for y in range(108, image.height - 28):
+        for x in range(162, image.width - 4):
+            if x >= image.width - 142 and y < 250:
+                continue
+            if min(pixels[x, y]) < 120:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None
+    return max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+
+
+def feature_pixels(image):
+    """Viewport pixels drawn by geometry pens (black body edges, blue sketch
+    curves, red selection, shaded faces); the light grid and dimmed lines are
+    excluded."""
+    region = image.crop((182, 108, image.width - 145, image.height - 28))
+    data = region.convert('RGB').tobytes()
+    return sum(min(data[i:i + 3]) < 120 for i in range(0, len(data), 3))
 
 
 def cube_region(image):
@@ -137,6 +186,152 @@ def component_pixels(image):
 async def state_is(page, name, predicate, timeout=70):
     return await wait_screen(page, name, lambda text: text == 'yes', timeout=timeout,
                              reader=lambda image: 'yes' if predicate(rendered_state(image) or {}, image) else 'no')
+
+
+async def features_are(page, name, predicate, timeout=70):
+    """Wait for a settled frame whose feature telemetry satisfies predicate."""
+    return await wait_screen(page, name, lambda text: text == 'yes', timeout=timeout,
+                             reader=lambda image: 'yes' if predicate(feature_state(image) or {}, image) else 'no')
+
+
+async def modify_parameter(page, name, value):
+    """Parameters (fx): select the first row, replace its expression, Modify."""
+    await keys(page, '$altt$10p$10')
+    await wait_screen(page, f'{name}-dialog', lambda text: 'parameters' in text, title=True)
+    await page.wait_for_timeout(2500)
+    # Name, Expression, Add, Modify, Delete -> list; Down selects row 1.
+    await keys(page, '$tab$10$tab$10$tab$10$tab$10$tab$10')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$down$10')
+    await page.wait_for_timeout(1500)
+    await keys(page, '$alte$10')
+    await page.wait_for_timeout(1000)
+    await page.evaluate('(text) => cadDebug.type(text)', value)
+    await page.wait_for_timeout(1000)
+    await keys(page, '$altm$10')
+    await page.wait_for_timeout(2500)
+    (await frame(page)).save(OUTPUT / f'{name}-modified.png')
+    await keys(page, '$esc$10')
+
+
+async def part_feature_steps(page, headed):
+    """Inventor-style part: W=100, sketch rectangle W x 60, extrude 40,
+    then W=200 must widen the body (associativity); save/reopen."""
+    await progress(page, 'Part features: Parameters W = 100', headed)
+    await keys(page, '$altt$10p$10')
+    await wait_screen(page, 'feat-params-dialog', lambda text: 'parameters' in text, title=True)
+    await page.wait_for_timeout(2500)
+    await page.evaluate('(text) => cadDebug.type(text)', 'W')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$tab$10')
+    await page.wait_for_timeout(1000)
+    await page.evaluate('(text) => cadDebug.type(text)', '100')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$enter$10')
+    await page.wait_for_timeout(2500)
+    await keys(page, '$esc$10')
+    await state_is(page, 'feat-params-dirty', lambda state, image: state.get('dirty'))
+    await progress(page, 'Part > Start 2D Sketch on XY', headed)
+    await keys(page, '$altp$10s$10')
+    await wait_screen(page, 'feat-sketch-dialog', lambda text: 'sketch' in text, title=True)
+    await page.wait_for_timeout(2500)
+    await keys(page, '$enter$10')
+    await features_are(page, 'feat-sketch-mode', lambda f, image: f.get('features') == 1 and f.get('sketch_mode'))
+    await progress(page, 'Rectangle: center 0,0, width W, height 60', headed)
+    await keys(page, '$altp$10r$10')
+    await wait_screen(page, 'feat-rect-dialog', lambda text: 'rectangle' in text, title=True)
+    await page.wait_for_timeout(2500)
+    await keys(page, '$tab$10$tab$10')
+    await page.wait_for_timeout(1000)
+    await page.evaluate('(text) => cadDebug.type(text)', 'W')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$tab$10')
+    await page.wait_for_timeout(1000)
+    await page.evaluate('(text) => cadDebug.type(text)', '60')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$enter$10')
+    await features_are(page, 'feat-rectangle', lambda f, image: f.get('bounds') and f.get('extent_x') == 100)
+    await progress(page, 'Finish Sketch, then Extrude 40', headed)
+    await keys(page, '$altp$10f$10')
+    await features_are(page, 'feat-finished', lambda f, image: f.get('features') == 1 and not f.get('sketch_mode'))
+    await keys(page, '$altp$10e$10')
+    await wait_screen(page, 'feat-extrude-dialog', lambda text: 'extrude' in text, title=True)
+    await page.wait_for_timeout(2500)
+    await page.evaluate('(text) => cadDebug.type(text)', '40')
+    await page.wait_for_timeout(1000)
+    await keys(page, '$enter$10')
+    narrow = await features_are(page, 'feat-extruded', lambda f, image: f.get('features') == 2 and
+                                f.get('errors') == 0 and f.get('extent_x') == 100 and feature_pixels(image) > 300)
+    narrow = await settled(page)
+    narrow_pixels = feature_pixels(narrow)
+    print(f'features: extruded body pixels={narrow_pixels}', flush=True)
+    # View > Front zooms to fit: the body's on-screen aspect is W:60.
+    await keys(page, '$altv$10f$10')
+    await page.wait_for_timeout(3000)
+    front = await settled(page)
+    front.save(OUTPUT / 'feat-front-w100.png')
+    narrow_box = geometry_box(front)
+    assert narrow_box, 'no body drawn in the front view'
+    await keys(page, '$altv$10i$10')
+    await page.wait_for_timeout(3000)
+    await progress(page, 'Shaded view of the extrusion', headed)
+    await keys(page, '$altv$10h$10')
+    shaded = await features_are(page, 'feat-shaded', lambda f, image: f.get('shaded') and
+                                (rendered_state(image) or {}).get('shaded'))
+    shaded = await settled(page)
+    print(f'features: shaded pixels={surface_pixels(shaded)} wire={surface_pixels(narrow)}', flush=True)
+    # Filled faces cover far more of the viewport than the 12 body edges.
+    assert surface_pixels(shaded) - surface_pixels(narrow) > 3000, (surface_pixels(shaded), surface_pixels(narrow))
+    await keys(page, '$altv$10w$10')
+    await features_are(page, 'feat-wireframe', lambda f, image: not f.get('shaded') and
+                       not (rendered_state(image) or {}).get('shaded'))
+    await progress(page, 'Parameters: W = 200 widens the extrusion', headed)
+    await modify_parameter(page, 'feat-w200', '200')
+    await features_are(page, 'feat-wider', lambda f, image: f.get('extent_x') == 200 and f.get('errors') == 0)
+    wide = await settled(page)
+    wide.save(OUTPUT / 'feat-iso-w200.png')
+    await keys(page, '$altv$10f$10')
+    await page.wait_for_timeout(3000)
+    front = await settled(page)
+    front.save(OUTPUT / 'feat-front-w200.png')
+    wide_box = geometry_box(front)
+    assert wide_box, 'no body drawn in the front view'
+    narrow_aspect = narrow_box[0] / narrow_box[1]
+    wide_aspect = wide_box[0] / wide_box[1]
+    print(f'features: front-view body box W=100 {narrow_box} (aspect {narrow_aspect:.2f}) -> '
+          f'W=200 {wide_box} (aspect {wide_aspect:.2f})', flush=True)
+    assert wide_aspect > narrow_aspect * 1.5, (narrow_box, wide_box)
+    await keys(page, '$altv$10i$10')
+    await page.wait_for_timeout(3000)
+    await progress(page, 'Parameters: W = 1000 puts Sketch1 in error, Extrusion1 blocked', headed)
+    await modify_parameter(page, 'feat-w1000', '1000')
+    failed = await features_are(page, 'feat-error', lambda f, image: f.get('errors') == 2 and not f.get('bounds'))
+    # Diagnostic only: the selected (inverted) row is not OCR-readable.
+    browser_rows = failed.crop((0, 128, 156, failed.height - 30)).convert('L').resize((312, (failed.height - 158) * 2))
+    print('features: browser OCR in error state:', repr(recognize(browser_rows)), flush=True)
+    await modify_parameter(page, 'feat-w200-again', '200')
+    await features_are(page, 'feat-healed', lambda f, image: f.get('errors') == 0 and f.get('extent_x') == 200)
+    await progress(page, 'Save C:\\FEAT.CAD, New, reopen: the body comes back', headed)
+    await keys(page, '$ctrls$10')
+    await dialog(page, 'feat-save-dialog')
+    await page.wait_for_timeout(1500)
+    await page.evaluate('(text) => cadDebug.type(text)', 'C:\\FEAT.CAD\r')
+    await wait_screen(page, 'feat-saved', lambda text: 'feat.cad' in text, title=True)
+    await state_is(page, 'feat-clean', lambda state, image: not state.get('dirty'))
+    await keys(page, '$ctrln$10')
+    await features_are(page, 'feat-new', lambda f, image: f.get('features') == 0 and not f.get('bounds') and
+                       feature_pixels(image) * 3 < narrow_pixels)
+    await keys(page, '$ctrlo$10')
+    await dialog(page, 'feat-open-dialog')
+    await page.wait_for_timeout(1500)
+    await page.evaluate('(text) => cadDebug.type(text)', 'C:\\FEAT.CAD\r')
+    reopened = await features_are(page, 'feat-reopened', lambda f, image: f.get('features') == 2 and
+                                  f.get('extent_x') == 200 and f.get('errors') == 0 and feature_pixels(image) > 300)
+    assert not (rendered_state(reopened) or {}).get('dirty'), rendered_state(reopened)
+    await wait_screen(page, 'feat-reopened-caption', lambda text: 'feat.cad' in text, title=True)
+    print(f'features: reopened body pixels={feature_pixels(reopened)}', flush=True)
+    await keys(page, '$ctrln$10')
+    await counts(page, 'feat-empty-after', 0, 0)
 
 
 async def main(headed=False, hold=False, windows=False):
@@ -296,6 +491,7 @@ async def main(headed=False, hold=False, windows=False):
             print(f'parts: reopened component pixels={component_pixels(reopened)} (closed={component_pixels(cleared)})', flush=True)
             await keys(page, '$ctrln$10')
             await counts(page, 'parts-empty-after-asm', 0, 0)
+            await part_feature_steps(page, headed)
             await progress(page, 'Load Boeing 747-400 demo in shaded mode', headed)
             await keys(page, '$altd$10b$10')
             shaded_image = await counts(page, 'aircraft-loaded', 236, 396)

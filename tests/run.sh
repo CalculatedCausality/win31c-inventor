@@ -57,3 +57,9 @@ cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_script.c" "$root/cad_crea
 # --- parts (Place Component: part-file occurrences; writes PT*.CAD in the scratch cwd) ---
 cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_parts.c" "$root/cad_assembly.c" "$root/cad_document.c" "$root/cad_model.c" "$root/cad_create.c" "$root/cad_sketch.c" "$root/tests/parts_test.c" -o "$scratch/parts_test"
 (cd "$scratch" && "$scratch/parts_test")
+# --- features (parametric feature tree over cad_sketch + cad_userparams) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_features.c" "$root/cad_sketch.c" "$root/cad_userparams.c" "$root/cad_params.c" "$root/tests/features_test.c" -o "$scratch/features_test"
+"$scratch/features_test"
+# --- featureui (CAD.EXE part-modeling glue; behaviour tested via cad_editor_test.py) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror -c "$root/cad_featureui.c" -o "$scratch/cad_featureui.o"
+CAD_EDITOR_SANITIZE=1 python3 "$root/tests/cad_editor_test.py"

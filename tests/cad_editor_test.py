@@ -50,6 +50,7 @@ shim = r'''
 #include "cad_vconstraints.h"
 #include "cad_script.h"
 #include "cad_parts.h"
+#include "cad_featureui.h"
 typedef int BOOL;
 #define NEAR
 typedef int HWND;
@@ -90,7 +91,7 @@ static int dialogOK=1;
 static char chosenPath[128]="TEST.CAD";
 static char lastMessage[512];
 static int dialogResult=1;
-static int ParametersDlg, DistanceDlg, PlacementDlg;
+static int ParametersDlg, DistanceDlg, PlacementDlg, FeatureDlg;
 /* Optional per-dialog hook: emulates the user editing dialog in/out globals. */
 static void (*dialogHook)(int id);
 #define IDD_PARAMETERS_SHIM 0
@@ -100,7 +101,8 @@ static void InvalidateRect(HWND h,void *r,BOOL e) { (void)h;(void)r;(void)e; }
 static int MessageBox(HWND h,const char *s,const char *t,int f)
 { (void)h;(void)t;(void)f; if (strncmp(s,"Save changes",12)) { ++errors; strncpy(lastMessage,s,511); } return answer; }
 static void SyncConstraints(void);
-static void Changed(HWND h) { (void)h; ++changes; SyncConstraints(); }
+static void SyncFeatures(void);
+static void Changed(HWND h) { (void)h; ++changes; SyncFeatures(); SyncConstraints(); }
 /* Native modal dialogs: the test presets their in/out globals. */
 static int RunDialog(HWND h,FARPROC p,int id) { (void)h;(void)p; if (dialogHook) dialogHook(id); return dialogResult; }
 static void UpdateUI(HWND h) { (void)h; }
@@ -128,7 +130,8 @@ names = ["ISin", "ICos", "VertexIndex", "MarkSaved", "Dirty", "ParseNumber",
           "FinishConstraintEdit", "AddConstraint", "DistanceCommand", "HistorySignature",
           "FollowUnits", "UndoRedo", "ParamLookup", "RunMacro", "Command", "Key",
           "PartsText", "PartsMessage", "FitPoint", "ParseOffset", "ParseYaw",
-          "ComponentSegment", "ComponentCommand"]
+          "ComponentSegment", "ComponentCommand", "SyncFeatures", "SketchView",
+          "FeatureCommand"]
 
 tests = r'''
 static void LineTo(HDC h,int x,int y)
@@ -405,6 +408,189 @@ static void parts_tests(void)
     Command(1,ID_DEMO_HOUSE); assert(!cad_parts_count(&parts) && model.vertex_count==30);
     (void)count;
 }
+/* ---- part features: the hook plays the native FeatureDlg (fill fields,
+ * press OK -> cad_fui_apply; on a rejected OK the user cancels). ---- */
+static const char *hookFields[4];
+static const char *hookPoints;
+static int hookOption=-1, hookApplied;
+static const char *hookParam, *hookExpr;
+static void FeatureHook(int id)
+{
+    int i;
+    if (id==IDD_PARAMETERS) {
+        assert(cad_userparams_set_expression_named(&userParams,hookParam,hookExpr,NULL)==CAD_UP_OK);
+        return;
+    }
+    assert(id==(cad_fui_dialog.kind==CAD_FUI_SKETCH ? IDD_FEAT_SKETCH : cad_fui_dialog.kind==CAD_FUI_RENAME ?
+        IDD_FEAT_RENAME : cad_fui_dialog.kind>=CAD_FUI_EXTRUDE ? IDD_FEAT_SOLID : IDD_FEAT_PROFILE));
+    for (i=0; i<4; ++i) if (hookFields[i]) strcpy(cad_fui_dialog.fields[i],hookFields[i]);
+    if (hookPoints) strcpy(cad_fui_dialog.points,hookPoints);
+    if (hookOption>=0) cad_fui_dialog.option=hookOption;
+    hookApplied=cad_fui_apply();
+    if (!hookApplied) { ++errors; strncpy(lastMessage,cad_fui_dialog.message,511); }
+    dialogResult=hookApplied ? IDOK : IDCANCEL;
+}
+static int Feature(int command,const char *a,const char *b,const char *c,const char *d,const char *points,int option)
+{
+    hookFields[0]=a; hookFields[1]=b; hookFields[2]=c; hookFields[3]=d; hookPoints=points; hookOption=option;
+    hookApplied=-1; dialogHook=FeatureHook; Command(1,command); dialogHook=NULL; dialogResult=IDOK;
+    return hookApplied;
+}
+static void SetParam(const char *name,const char *expr)
+{
+    hookParam=name; hookExpr=expr; dialogHook=FeatureHook;
+    Command(1,ID_TOOLS_PARAMETERS); dialogHook=NULL;
+}
+static void Row(unsigned row,char *text)
+{
+    unsigned id; int profile;
+    assert(cad_fui_row(row,text,260,&id,&profile));
+}
+static long ExtentX(void)
+{
+    long lo[3],hi[3];
+    assert(cad_fui_bounds(lo,hi));
+    return hi[0]-lo[0];
+}
+static long TopZ(void)
+{
+    long lo[3],hi[3];
+    assert(cad_fui_bounds(lo,hi));
+    return hi[2];
+}
+static void feature_tests(void)
+{
+    char text[260];
+    unsigned sketch,extrude,sketch2;
+    unsigned long t;
+    int oldErrors,count;
+    long lo[3],hi[3];
+    answer=IDNO; dialogOK=1; capture=0; dialogResult=IDOK;
+    Command(1,ID_FILE_NEW); assert(!cad_fui_count() && !Dirty());
+    assert(cad_userparams_add(&userParams,"W","100",NULL,NULL)==CAD_UP_OK);
+    /* Profiles need sketch mode. */
+    oldErrors=errors; assert(Feature(ID_FEATURE_RECT,"0","0","W","60",NULL,-1)==-1);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"Start 2D Sketch") && !cad_fui_count());
+    /* Start 2D Sketch (XY): sketch mode, view normal to the plane. */
+    yaw=32; pitch=24;
+    assert(Feature(ID_FEATURE_SKETCH,"0",NULL,NULL,NULL,NULL,CAD_FEAT_XY)==1);
+    sketch=selectedFeature; assert(sketch && cad_fui_active_sketch()==sketch && yaw==0 && pitch==0);
+    assert(!strcmp(cad_fui_name(sketch),"Sketch1") && Dirty());
+    assert(Feature(ID_FEATURE_RECT,"0","0","W","60",NULL,-1)==1);
+    assert(selectedFeature==sketch && selectedProfile==0);
+    Command(1,ID_FEATURE_FINISH); assert(!cad_fui_active_sketch() && yaw==32 && pitch==24);
+    /* Extrude 40 (default sketch = last sketch, profile ALL). */
+    assert(Feature(ID_FEATURE_EXTRUDE,"ALL","40",NULL,NULL,NULL,CAD_FEAT_POSITIVE)==1);
+    extrude=selectedFeature; assert(cad_fui_type(extrude)==CAD_FEAT_EXTRUDE && cad_fui_count()==2);
+    assert(!cad_fui_errors() && cad_fui_output()->face_count>0 && ExtentX()==100 && TopZ()==40);
+    assert(cad_fui_bounds(lo,hi) && lo[0]==-50 && lo[1]==-30 && hi[1]==30 && lo[2]==0);
+    Row(0,text); assert(!strcmp(text,"Sketch1 (XY, 1 profile)"));
+    Row(1,text); assert(!strcmp(text,"  Rectangle 1"));
+    Row(2,text); assert(!strcmp(text,"Extrusion1 (Sketch1, 40)"));
+    assert(!cad_fui_row(3,text,260,&sketch2,&count));
+    /* Telemetry word 2: count, error count, X extent, bounds, checksum. */
+    t=cad_fui_telemetry(1);
+    assert((t&31)==2 && ((t>>5)&31)==0 && !(t&(1UL<<10)) && (t&(1UL<<11)) && ((t>>12)&1023)==100 && (t&(1UL<<23)));
+    assert((t>>24)==((t^(t>>8)^(t>>16)^0x5c)&255));
+    /* Zoom all covers the body even without model vertices. */
+    canvasWidth=586; canvasHeight=496; Fit(); assert(centerX==0 && centerY==0 && centerZ==20);
+    /* Shaded mode is available for feature faces (not only the 747). */
+    Command(1,ID_VIEW_SHADED); assert(shaded); Command(1,ID_VIEW_WIREFRAME); assert(!shaded);
+    /* Associativity: changing W in Parameters resizes the extrusion. */
+    SetParam("W","200"); assert(ExtentX()==200 && !cad_fui_errors());
+    /* Error and blocked states: W too large for the sketch range. */
+    SetParam("W","1000");
+    assert(cad_fui_errors()==2 && !cad_fui_bounds(lo,hi));
+    Row(0,text); assert(!strncmp(text,"(!) Sketch1 (XY, 1 profile) - profile 1: ",41));
+    Row(1,text); assert(!strcmp(text,"  (!) Rectangle 1"));
+    Row(2,text); assert(!strcmp(text,"(blocked) Extrusion1 (Sketch1, 40)"));
+    t=cad_fui_telemetry(0); assert(((t>>5)&31)==2 && !(t&(1UL<<23)));
+    SetParam("W","200"); assert(!cad_fui_errors() && ExtentX()==200);
+    /* Suppress / unsuppress. */
+    selectedFeature=extrude; selectedProfile=-1;
+    Command(1,ID_FEATURE_SUPPRESS); Row(2,text);
+    assert(!strcmp(text,"(suppressed) Extrusion1 (Sketch1, 40)") && !cad_fui_output()->face_count);
+    Command(1,ID_FEATURE_SUPPRESS); Row(2,text); assert(!strstr(text,"suppressed") && cad_fui_output()->face_count);
+    /* Delete a sketch in use: refused with an explanation (Del key path). */
+    selectedFeature=sketch; selectedProfile=-1; oldErrors=errors;
+    Command(1,ID_EDIT_DELETE); assert(errors==oldErrors+1 && strstr(lastMessage,"Extrusion1") && cad_fui_count()==2);
+    /* Deleting the only profile (used through ALL) leaves the extrusion in
+     * error; feature undo brings it back. */
+    selectedProfile=0; oldErrors=errors;
+    Command(1,ID_EDIT_DELETE); assert(errors==oldErrors && cad_fui_errors()==1 && selectedFeature==0);
+    Row(1,text); assert(!strncmp(text,"(!) Extrusion1",14) && strstr(text,"no profiles"));
+    Command(1,ID_FEATURE_UNDO); assert(!cad_fui_errors() && ExtentX()==200);
+    /* Edit (double-click / Enter) prefills; distance W/2 -> 100. */
+    selectedFeature=extrude; selectedProfile=-1;
+    assert(Feature(ID_EDIT_PROPERTIES,NULL,"W/2",NULL,NULL,NULL,-1)==1 && TopZ()==100);
+    assert(!strcmp(cad_fui_dialog.fields[0],"ALL") && cad_fui_dialog.sketch==sketch);
+    /* A new error is rejected and the tree is unchanged. */
+    oldErrors=errors; assert(Feature(ID_FEATURE_EDIT,NULL,"500",NULL,NULL,NULL,-1)==0);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"distance") && TopZ()==100);
+    oldErrors=errors; assert(Feature(ID_FEATURE_EDIT,"7","40",NULL,NULL,NULL,-1)==0);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"Profile") && TopZ()==100);
+    /* Feature undo reverts the last kept edit (distance back to 40). */
+    Command(1,ID_FEATURE_UNDO); assert(TopZ()==40);
+    /* Profile edit prefills the rectangle; reorder respects dependencies. */
+    selectedFeature=sketch; selectedProfile=0;
+    assert(Feature(ID_FEATURE_EDIT,NULL,NULL,"W/4",NULL,NULL,-1)==1 && ExtentX()==50);
+    assert(!strcmp(cad_fui_dialog.fields[3],"60"));
+    selectedFeature=extrude; selectedProfile=-1; oldErrors=errors;
+    Command(1,ID_FEATURE_UP); assert(errors==oldErrors+1 && strstr(lastMessage,"reorder"));
+    /* Rename, then dirty follows the exact feature text. */
+    assert(Feature(ID_FEATURE_RENAME,"Body",NULL,NULL,NULL,NULL,-1)==1 && !strcmp(cad_fui_name(extrude),"Body"));
+    /* Second sketch on XZ with a polygon; revolve a ring about V. */
+    assert(Feature(ID_FEATURE_SKETCH,"10",NULL,NULL,NULL,NULL,CAD_FEAT_XZ)==1);
+    sketch2=selectedFeature; assert(pitch==64 && cad_fui_active_sketch()==sketch2);
+    assert(Feature(ID_FEATURE_POLY,NULL,NULL,NULL,NULL,"120,0; W/2+100 ,0;120,30",-1)==1);
+    oldErrors=errors; assert(Feature(ID_FEATURE_POLY,NULL,NULL,NULL,NULL,"1,2;3",-1)==0);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"Points"));
+    assert(Feature(ID_FEATURE_CIRCLE,"300","0","20","12",NULL,-1)==1);
+    Command(1,ID_FEATURE_FINISH);
+    assert(Feature(ID_FEATURE_REVOLVE,"1","12",NULL,NULL,NULL,CAD_FEAT_AXIS_V)==1);
+    assert(cad_fui_count()==4 && !cad_fui_errors());
+    oldErrors=errors; assert(Feature(ID_FEATURE_REVOLVE,"ALL","30",NULL,NULL,NULL,0)==0);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"Segments") && cad_fui_count()==4);
+    /* Export/drawing materialize feature body edges (not sketch curves). */
+    assert(Materialize() && materialVertices>8 && materialEdges>12 && !materialSkipped);
+    lines=0; DrawSheet(1); assert(lines>0);
+    /* Save / New / reopen round trip with [FEATURES]; dirty tracking. */
+    strcpy(chosenPath,"FEAT.CAD"); filePath[0]=0; assert(SaveDocument(1,FALSE) && !Dirty());
+    assert(strstr(extText,"[FEATURES]\nN ") && strstr(extText,"\"Body\""));
+    selectedFeature=extrude; Command(1,ID_FEATURE_SUPPRESS); assert(Dirty());
+    Command(1,ID_FEATURE_SUPPRESS); assert(!Dirty());
+    count=(int)cad_fui_output()->segment_count;
+    Command(1,ID_FILE_NEW); assert(!cad_fui_count() && !cad_fui_output()->segment_count && !Dirty());
+    Command(1,ID_FILE_OPEN);
+    assert(cad_fui_count()==4 && (int)cad_fui_output()->segment_count==count && !Dirty());
+    assert(ExtentX()>=50);
+    /* Undo ring and sketch mode do not survive a load. */
+    assert(!cad_fui_can_undo() && !cad_fui_active_sketch());
+    /* Associativity after reopen: W drives both sketches. */
+    SetParam("W","100"); assert(Dirty());
+    SetParam("W","200"); assert(!Dirty());
+    /* Atomic load: a bad [FEATURES] keeps the whole current document. */
+    assert(cad_document_save_ex("BADFEAT.CAD",&model,"[PARAMS]\nP Q 5\n[FEATURES]\nN 1\nF 1 BOGUS\n",
+        strlen("[PARAMS]\nP Q 5\n[FEATURES]\nN 1\nF 1 BOGUS\n"))==CAD_DOC_OK);
+    strcpy(chosenPath,"BADFEAT.CAD"); oldErrors=errors; Command(1,ID_FILE_OPEN);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"[FEATURES] line 2") && !strcmp(filePath,"FEAT.CAD"));
+    assert(cad_fui_count()==4 && !cad_userparams_find(&userParams,"Q") && cad_userparams_find(&userParams,"W") && !Dirty());
+    /* A [PARTS] failure after valid [FEATURES] restores the previous tree. */
+    assert(cad_document_save_ex("BADFEAT.CAD",&model,"[FEATURES]\nN 1\n[PARTS]\nN 1\nO 1 0 0 0 0 0 X\n",
+        strlen("[FEATURES]\nN 1\n[PARTS]\nN 1\nO 1 0 0 0 0 0 X\n"))==CAD_DOC_OK);
+    oldErrors=errors; Command(1,ID_FILE_OPEN);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"[PARTS]") && cad_fui_count()==4 && !Dirty());
+    /* Model undo moves geometry only; features stay. */
+    assert(cad_create_line(&model,0,0,0,10,0,0)==CAD_OK);
+    Command(1,ID_EDIT_UNDO); assert(!model.vertex_count && cad_fui_count()==4);
+    /* Delete the revolve, then its sketch; feature undo restores it. */
+    selectedFeature=cad_fui_features()->items[3].id; selectedProfile=-1;
+    Command(1,ID_EDIT_DELETE); assert(cad_fui_count()==3 && !selectedFeature);
+    selectedFeature=sketch2; Command(1,ID_FEATURE_DELETE); assert(cad_fui_count()==2);
+    Command(1,ID_FEATURE_UNDO); assert(cad_fui_count()==3);
+    /* New and demos clear the tree. */
+    Command(1,ID_DEMO_HOUSE); assert(!cad_fui_count() && model.vertex_count==30);
+}
 int main(void)
 {
     CadVertex v,before,other;
@@ -414,7 +600,8 @@ int main(void)
     long value=99;
     CadSketchPoint points[12];
     FILE *file;
-    assert(cad_model_init(&model)==CAD_OK); cad_model_init(&stage); ResetDocumentState(); MarkSaved();
+    assert(cad_model_init(&model)==CAD_OK); cad_model_init(&stage);
+    cad_fui_init(&userParams); ResetDocumentState(); MarkSaved();
     assert(!model.vertex_count && !model.edge_count && !Dirty());
     width=760;height=520;canvasWidth=586;canvasHeight=496; Fit(); Project();
     assert(focal>=1 && HitTest(10,10)==-1 && Materialize());
@@ -551,7 +738,8 @@ int main(void)
     assert(cad_model_cancel(&model)==CAD_OK && AircraftTopology());
     integration_tests();
     parts_tests();
-    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands, components passed");
+    feature_tests();
+    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands, components, part features passed");
     return 0;
 }
 '''
@@ -572,7 +760,8 @@ with tempfile.TemporaryDirectory(prefix="cad-editor-") as temp:
                                              "cad_document.c", "cad_export.c", "cad_drawing.c", "cad_aircraft.c", "cad_viewcube.c",
                                              "cad_params.c", "cad_userparams.c", "cad_constraints.c",
                                              "cad_vconstraints.c", "cad_script.c",
-                                             "cad_assembly.c", "cad_parts.c"]),
+                                             "cad_assembly.c", "cad_parts.c",
+                                             "cad_features.c", "cad_featureui.c"]),
                     "-o", str(executable)], check=True)
     subprocess.run([str(executable)], cwd=temp, check=True)
 
