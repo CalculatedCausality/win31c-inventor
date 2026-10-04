@@ -21,6 +21,18 @@ BEGIN
         MENUITEM "&Redo\tCtrl+Y", ID_EDIT_REDO
         MENUITEM "&Delete\tDel", ID_EDIT_DELETE
         MENUITEM "&Properties...\tEnter", ID_EDIT_PROPERTIES
+        MENUITEM SEPARATOR
+        POPUP "&Constrain"
+        BEGIN
+            MENUITEM "&Coincident (2 vertices)", ID_CONSTRAIN_COINCIDENT
+            MENUITEM "Align &X (2 vertices)", ID_CONSTRAIN_ALIGN_X
+            MENUITEM "Align &Y (2 vertices)", ID_CONSTRAIN_ALIGN_Y
+            MENUITEM "Align &Z (2 vertices)", ID_CONSTRAIN_ALIGN_Z
+            MENUITEM "&Distance... (2 vertices)", ID_CONSTRAIN_DISTANCE
+            MENUITEM "&Fix (1 vertex)", ID_CONSTRAIN_FIX
+            MENUITEM SEPARATOR
+            MENUITEM "D&elete constraint", ID_CONSTRAIN_DELETE
+        END
     END
     POPUP "&Create"
     BEGIN
@@ -28,6 +40,15 @@ BEGIN
         MENUITEM "&Rectangle (XY)...", ID_CREATE_RECTANGLE
         MENUITEM "&Box...", ID_CREATE_BOX
         MENUITEM "&Extrude sketch...", ID_CREATE_EXTRUDE
+    END
+    POPUP "&Insert"
+    BEGIN
+        MENUITEM "Place &Component...", ID_INSERT_PLACE
+        MENUITEM "&Move Component...", ID_INSERT_MOVE
+        MENUITEM "&Ground/Unground", ID_INSERT_GROUND
+        MENUITEM "&Remove Component", ID_INSERT_REMOVE
+        MENUITEM SEPARATOR
+        MENUITEM "Re&load Components", ID_INSERT_RELOAD
     END
     POPUP "&View"
     BEGIN
@@ -50,6 +71,9 @@ BEGIN
             MENUITEM "&Unspecified", ID_TOOLS_UNSPECIFIED
             MENUITEM "&Millimetres", ID_TOOLS_MM
         END
+        MENUITEM "&Parameters (fx)...", ID_TOOLS_PARAMETERS
+        MENUITEM "Run &Macro...", ID_TOOLS_RUN_MACRO
+        MENUITEM SEPARATOR
         MENUITEM "&Snap to 10\tF9", ID_TOOLS_SNAP
         MENUITEM "&Debug test status", ID_TOOLS_TEST_STATUS
     END
@@ -81,7 +105,7 @@ STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Coordinates"
 FONT 8, "MS Sans Serif"
 BEGIN
-    LTEXT "Integer coordinates -400..400; sizes must be positive.", -1, 8, 7, 206, 18
+    LTEXT "Integers or parameter expressions (-400..400); sizes positive.", -1, 8, 7, 206, 18
     LTEXT "X", IDC_LABEL1, 8, 30, 90, 10
     EDITTEXT IDC_VALUE1, 108, 28, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
     LTEXT "Y", IDC_LABEL2, 8, 47, 90, 10
@@ -107,8 +131,59 @@ BEGIN
     LTEXT "Closing edge is implicit. No repeated first point or crossings.", -1, 8, 22, 256, 12
     LTEXT "&Profile", -1, 8, 40, 48, 10
     EDITTEXT IDC_PROFILE, 8, 54, 256, 14, ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT "&Height (+Z, 1..400)", -1, 8, 78, 110, 12
+    LTEXT "&Height (+Z, 1..400, fx)", -1, 8, 78, 110, 12
     EDITTEXT IDC_HEIGHT, 126, 76, 62, 14, ES_AUTOHSCROLL | WS_TABSTOP
     DEFPUSHBUTTON "OK", IDOK, 156, 108, 50, 14
     PUSHBUTTON "Cancel", IDCANCEL, 214, 108, 50, 14
+END
+
+IDD_PARAMETERS DIALOG 0, 0, 280, 184
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Parameters (fx)"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "&Name", -1, 8, 8, 40, 10
+    EDITTEXT IDC_PARAM_NAME, 52, 6, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "&Expression", -1, 8, 25, 40, 10
+    EDITTEXT IDC_PARAM_EXPR, 52, 23, 220, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "&Add", IDC_PARAM_ADD, 52, 40, 50, 14
+    PUSHBUTTON "&Modify", IDC_PARAM_MODIFY, 108, 40, 50, 14
+    PUSHBUTTON "&Delete", IDC_PARAM_DELETE, 164, 40, 50, 14
+    LISTBOX IDC_PARAM_LIST, 8, 60, 264, 92, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    LTEXT "", IDC_PARAM_UNITS, 8, 160, 200, 18
+    PUSHBUTTON "Close", IDCANCEL, 222, 162, 50, 14
+END
+
+IDD_DISTANCE DIALOG 0, 0, 200, 92
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Distance constraint"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "Second minus first vertex along:", IDC_DIST_LABEL, 8, 8, 184, 10
+    CONTROL "&X", IDC_AXIS_X, "BUTTON", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 8, 22, 30, 12
+    CONTROL "&Y", IDC_AXIS_Y, "BUTTON", BS_AUTORADIOBUTTON, 44, 22, 30, 12
+    CONTROL "&Z", IDC_AXIS_Z, "BUTTON", BS_AUTORADIOBUTTON, 80, 22, 30, 12
+    LTEXT "&Value (expression)", -1, 8, 42, 70, 10
+    EDITTEXT IDC_DIST_VALUE, 82, 40, 110, 12, ES_AUTOHSCROLL | WS_TABSTOP | WS_GROUP
+    DEFPUSHBUTTON "OK", IDOK, 86, 70, 50, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 142, 70, 50, 14
+END
+
+IDD_PLACEMENT DIALOG 0, 0, 230, 136
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Place component"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "", IDC_PLACE_PATH, 8, 6, 214, 10
+    LTEXT "Offsets: integers -2000..2000 or fx expressions (-400..400).", -1, 8, 18, 214, 10
+    LTEXT "&X offset", IDC_LABEL1, 8, 36, 96, 10
+    EDITTEXT IDC_VALUE1, 112, 34, 104, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "&Y offset", IDC_LABEL2, 8, 53, 96, 10
+    EDITTEXT IDC_VALUE2, 112, 51, 104, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "&Z offset", IDC_LABEL3, 8, 70, 96, 10
+    EDITTEXT IDC_VALUE3, 112, 68, 104, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Yaw about +Y (0, 45 ... 315 deg)", IDC_LABEL4, 8, 87, 102, 10
+    EDITTEXT IDC_VALUE4, 112, 85, 104, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "OK", IDOK, 112, 114, 50, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 168, 114, 50, 14
 END

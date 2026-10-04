@@ -23,3 +23,15 @@ for module in create document aircraft meshview; do
         "-fo=$scratch/cad_$module.obj" "$root/cad_$module.c"
     printf 'Win16 compile: cad_%s (large model) PASS\n' "$module"
 done
+# --- vconstraints (large model) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_vconstraints.obj" "$root/cad_vconstraints.c"
+printf 'Win16 compile: cad_vconstraints (large model) PASS\n'
+# --- userparams (large model) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_userparams.obj" "$root/cad_userparams.c"
+printf 'Win16 compile: cad_userparams (large model) PASS\n'
+# --- script (large model) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_script.obj" "$root/cad_script.c"
+printf 'Win16 compile: cad_script (large model) PASS\n'
+# --- parts (large model) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_parts.obj" "$root/cad_parts.c"
+printf 'Win16 compile: cad_parts (large model) PASS\n'

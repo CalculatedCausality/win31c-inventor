@@ -115,16 +115,35 @@ static long doc_coordinate(const unsigned char *p)
     return n <= 32767UL ? (long)n : (long)n - 65536L;
 }
 
-static int doc_parse(FILE *f, CadModel *m)
+/* Extension staging: read publishes it only after full validation. */
+static unsigned char doc_ext[CAD_DOC_EXT_MAX];
+
+int cad_document_check_extension(const char *ext, unsigned ext_len)
+{
+    unsigned int i;
+    unsigned char c;
+    if (ext_len > CAD_DOC_EXT_MAX) return CAD_DOC_RANGE;
+    if (!ext_len) return CAD_DOC_OK;
+    if (!ext) return CAD_DOC_FORMAT;
+    for (i = 0; i < ext_len; ++i) {
+        c = (unsigned char)ext[i];
+        if (c != 0x0a && (c < 0x20 || c > 0x7e)) return CAD_DOC_FORMAT;
+    }
+    return CAD_DOC_OK;
+}
+
+/* Parses into m and doc_ext; *ext_len receives the stored length. */
+static int doc_parse(FILE *f, CadModel *m, unsigned int *ext_len)
 {
     unsigned char h[24], r[8];
     unsigned short crc = 65535U;
-    unsigned long nv, ne, nextv, nexte, units;
+    unsigned long nv, ne, nextv, nexte, units, version, len = 0UL;
     unsigned int i;
     int status, ch;
     status = doc_get(f, h, sizeof(h), &crc);
     if (status) return status;
-    if (memcmp(h, "CADG", 4) || doc_word(h + 4) != 1UL)
+    version = doc_word(h + 4);
+    if (memcmp(h, "CADG", 4) || (version != 1UL && version != 2UL))
         return CAD_DOC_FORMAT;
     units = doc_word(h + 6); nv = doc_word(h + 8); ne = doc_word(h + 10);
     nextv = doc_long(h + 12); nexte = doc_long(h + 16);
@@ -150,32 +169,81 @@ static int doc_parse(FILE *f, CadModel *m)
         m->edges[i].a = (CadId)doc_word(r + 2);
         m->edges[i].b = (CadId)doc_word(r + 4);
     }
+    if (version == 2UL) {
+        status = doc_get(f, r, 2, &crc); if (status) return status;
+        len = doc_word(r);
+        if (len > CAD_DOC_EXT_MAX) return CAD_DOC_RANGE;
+        if (len) {
+            status = doc_get(f, doc_ext, (unsigned int)len, &crc);
+            if (status) return status;
+        }
+    }
     status = doc_get(f, r, 2, NULL); if (status) return status;
     ch = fgetc(f);
     if (ferror(f)) return CAD_DOC_IO;
     if (ch != EOF || doc_word(r) != crc) return CAD_DOC_FORMAT;
-    return doc_validate(m);
+    if (cad_document_check_extension((const char *)doc_ext,
+                                     (unsigned int)len))
+        return CAD_DOC_FORMAT;
+    status = doc_validate(m); if (status) return status;
+    *ext_len = (unsigned int)len;
+    return CAD_DOC_OK;
+}
+
+/* Publishes stage and staged text; capacity is checked before any copy. */
+static int doc_publish(int status, CadModel *live, const CadModel *stage,
+                       unsigned int len, char *buffer, unsigned int capacity,
+                       unsigned int *ext_len)
+{
+    if (status) return status;
+    if (buffer && len > capacity) return CAD_DOC_RANGE;
+    if (buffer) {
+        if (len) memcpy(buffer, doc_ext, len);
+        if (capacity > len) buffer[len] = 0;
+    }
+    if (ext_len) *ext_len = len;
+    memcpy(live, stage, sizeof(*live));
+    return CAD_DOC_OK;
+}
+
+int cad_document_read_ex(FILE *f, CadModel *live, CadModel *stage,
+                         char *ext_buffer, unsigned ext_capacity,
+                         unsigned *ext_len)
+{
+    unsigned int len = 0;
+    int status;
+    if (!f || !live || !stage || live == stage) return CAD_DOC_ARG;
+    status = doc_parse(f, stage, &len);
+    return doc_publish(status, live, stage, len, ext_buffer, ext_capacity,
+                       ext_len);
 }
 
 int cad_document_read(FILE *f, CadModel *live, CadModel *stage)
 {
-    int status;
-    if (!f || !live || !stage || live == stage) return CAD_DOC_ARG;
-    status = doc_parse(f, stage);
-    if (!status) memcpy(live, stage, sizeof(*live));
-    return status;
+    return cad_document_read_ex(f, live, stage, NULL, 0, NULL);
 }
 
-int cad_document_write(FILE *f, const CadModel *m)
+/* Model/extension preconditions shared by write and save, before any I/O. */
+static int doc_writable(const CadModel *m, const char *ext, unsigned int len)
+{
+    int status;
+    if (!m || m->transaction_active) return CAD_DOC_ARG;
+    status = cad_document_check_extension(ext, len);
+    if (status) return status == CAD_DOC_FORMAT ? CAD_DOC_ARG : status;
+    return doc_validate(m);
+}
+
+int cad_document_write_ex(FILE *f, const CadModel *m, const char *ext,
+                          unsigned ext_len)
 {
     unsigned char h[24], r[8];
     unsigned short crc = 65535U;
     unsigned int i;
     int status;
-    if (!f || !m || m->transaction_active) return CAD_DOC_ARG;
-    status = doc_validate(m); if (status) return status;
+    if (!f) return CAD_DOC_ARG;
+    status = doc_writable(m, ext, ext_len); if (status) return status;
     memcpy(h, "CADG", 4);
-    doc_put(h + 4, 1UL, 2); doc_put(h + 6, (unsigned long)m->units, 2);
+    doc_put(h + 4, 2UL, 2); doc_put(h + 6, (unsigned long)m->units, 2);
     doc_put(h + 8, m->vertex_count, 2); doc_put(h + 10, m->edge_count, 2);
     doc_put(h + 12, (unsigned long)m->next_vertex_id, 4);
     doc_put(h + 16, (unsigned long)m->next_edge_id, 4);
@@ -194,10 +262,21 @@ int cad_document_write(FILE *f, const CadModel *m)
         doc_put(r + 2, m->edges[i].a, 2); doc_put(r + 4, m->edges[i].b, 2);
         status = doc_emit(f, r, 6, &crc); if (status) return status;
     }
+    doc_put(r, ext_len, 2);
+    status = doc_emit(f, r, 2, &crc); if (status) return status;
+    if (ext_len) {
+        status = doc_emit(f, (const unsigned char *)ext, ext_len, &crc);
+        if (status) return status;
+    }
     doc_put(r, crc, 2);
     status = doc_emit(f, r, 2, NULL);
     if (status || fflush(f) != 0 || ferror(f)) return CAD_DOC_IO;
     return CAD_DOC_OK;
+}
+
+int cad_document_write(FILE *f, const CadModel *m)
+{
+    return cad_document_write_ex(f, m, NULL, 0);
 }
 
 static int doc_upper(int c)
@@ -258,34 +337,43 @@ static int doc_state(const char *path)
 #endif
 }
 
-int cad_document_load(const char *path, CadModel *live, CadModel *stage)
+int cad_document_load_ex(const char *path, CadModel *live, CadModel *stage,
+                         char *ext_buffer, unsigned ext_capacity,
+                         unsigned *ext_len)
 {
     char tmp[CAD_DOC_PATH_MAX + 1], bak[CAD_DOC_PATH_MAX + 1];
     FILE *f;
+    unsigned int len = 0;
     int status;
     if (!live || !stage || live == stage) return CAD_DOC_ARG;
     status = doc_paths(path, tmp, bak); if (status) return status;
     if (doc_state(path) != 1) return CAD_DOC_IO;
     f = fopen(path, "rb"); if (!f) return CAD_DOC_IO;
-    status = doc_parse(f, stage);
+    status = doc_parse(f, stage, &len);
     if (fclose(f) != 0) status = CAD_DOC_IO;
-    if (!status) memcpy(live, stage, sizeof(*live));
-    return status;
+    return doc_publish(status, live, stage, len, ext_buffer, ext_capacity,
+                       ext_len);
 }
 
-int cad_document_save(const char *path, const CadModel *m)
+int cad_document_load(const char *path, CadModel *live, CadModel *stage)
+{
+    return cad_document_load_ex(path, live, stage, NULL, 0, NULL);
+}
+
+int cad_document_save_ex(const char *path, const CadModel *m, const char *ext,
+                         unsigned ext_len)
 {
     char tmp[CAD_DOC_PATH_MAX + 1], bak[CAD_DOC_PATH_MAX + 1];
     FILE *f;
     int status, old, t, b;
     if (!m || m->transaction_active) return CAD_DOC_ARG;
     status = doc_paths(path, tmp, bak); if (status) return status;
-    status = doc_validate(m); if (status) return status;
+    status = doc_writable(m, ext, ext_len); if (status) return status;
     old = doc_state(path); t = doc_state(tmp); b = doc_state(bak);
     if (old < 0 || t < 0 || b < 0) return CAD_DOC_IO;
     if (old == 2 || t || b) return CAD_DOC_COLLISION;
     f = fopen(tmp, "wb"); if (!f) return CAD_DOC_IO;
-    status = cad_document_write(f, m);
+    status = cad_document_write_ex(f, m, ext, ext_len);
     if (fclose(f) != 0) status = CAD_DOC_IO;
     if (status) { remove(tmp); return status; }
     if (old && rename(path, bak) != 0) {
@@ -300,4 +388,9 @@ int cad_document_save(const char *path, const CadModel *m)
     }
     if (old && remove(bak) != 0) return CAD_DOC_IO;
     return CAD_DOC_OK;
+}
+
+int cad_document_save(const char *path, const CadModel *m)
+{
+    return cad_document_save_ex(path, m, NULL, 0);
 }

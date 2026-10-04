@@ -44,3 +44,16 @@ for module in export macro; do
         "$root/tests/${module}_test.c" -o "$scratch/${module}_test"
     "$scratch/${module}_test"
 done
+# --- vconstraints (vertex constraints over cad_constraints + cad_model) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_vconstraints.c" "$root/cad_constraints.c" "$root/cad_model.c" "$root/tests/vconstraints_test.c" -o "$scratch/vconstraints_test"
+# (separate lines: under set -e a failing non-final && operand does not abort)
+"$scratch/vconstraints_test"
+# --- userparams (Parameters fx table over cad_params) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_userparams.c" "$root/cad_params.c" "$root/tests/userparams_test.c" -o "$scratch/userparams_test"
+"$scratch/userparams_test"
+# --- script (generic CAD.EXE macro language over cad_create) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_script.c" "$root/cad_create.c" "$root/cad_model.c" "$root/cad_sketch.c" "$root/tests/script_test.c" -o "$scratch/script_test"
+"$scratch/script_test" "$root/examples"
+# --- parts (Place Component: part-file occurrences; writes PT*.CAD in the scratch cwd) ---
+cc -std=c89 -pedantic -Wall -Wextra -Werror "$root/cad_parts.c" "$root/cad_assembly.c" "$root/cad_document.c" "$root/cad_model.c" "$root/cad_create.c" "$root/cad_sketch.c" "$root/tests/parts_test.c" -o "$scratch/parts_test"
+(cd "$scratch" && "$scratch/parts_test")

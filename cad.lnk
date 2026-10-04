@@ -10,8 +10,16 @@ file out/cad_drawing.obj
 file out/cad_aircraft.obj
 file out/cad_meshview.obj
 file out/cad_viewcube.obj
+file out/cad_params.obj
+file out/cad_userparams.obj
+file out/cad_constraints.obj
+file out/cad_vconstraints.obj
+file out/cad_script.obj
+file out/cad_assembly.obj
+file out/cad_parts.obj
 library commdlg
 option resource=out/cad.res
 option description 'Win31 CAD - Generic document editor'
 option stack=12k
 option heapsize=4k
+option map=out/cad.map

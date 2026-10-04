@@ -35,8 +35,9 @@ for p do
         # The generic document and staging objects cannot share a 64KiB DGROUP.
         # All callers/dependencies use the same segmented large-model ABI.
         cadflags="-q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -fr"
-        "$WATCOM/binl64/wcc" $cadflags -fo=out/cad.obj cad.c
-        for module in model create document sketch export drawing aircraft meshview viewcube; do
+        "$WATCOM/binl64/wcc" $cadflags -we -fo=out/cad.obj cad.c
+        for module in model create document sketch export drawing aircraft meshview viewcube \
+                params userparams constraints vconstraints script assembly parts; do
             "$WATCOM/binl64/wcc" $cadflags "-fo=out/cad_$module.obj" "cad_$module.c"
         done
         "$WATCOM/binl64/wrc" -q -bt=windows -31 -r -fo=out/cad.res cad.rc
@@ -53,7 +54,13 @@ for p do
     test -s "out/$p.$ext"
     mcopy -i "$image" "out/$p.$ext" ::
     if [ "$p" = house ]; then
-        mcopy -i "$image" examples/RAISE.CMD ::
+        mcopy -o -i "$image" examples/RAISE.CMD ::
+    fi
+    if [ "$p" = cad ]; then
+        # Macros for Tools > Run Macro (CADSCRIPT; RAISE.CMD is HOUSE's HCMD).
+        for macro in examples/*.CMD; do
+            mcopy -o -i "$image" "$macro" ::
+        done
     fi
 done
 mv "$image" out/disk.img

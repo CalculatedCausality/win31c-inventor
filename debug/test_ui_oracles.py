@@ -22,10 +22,28 @@ class OracleTests(unittest.TestCase):
         assert state is not None
         self.assertEqual((state['vertices'], state['edges']), (236, 396))
         self.assertTrue(state['shaded'] and state['dirty'])
+        self.assertFalse(state['components'])
         pixels[14, 473] = (255, 255, 255)  # Torn row / incorrect payload.
         self.assertIsNone(rendered_state(image))
         pixels[14, 474] = (255, 255, 255)  # Both rows agree, checksum still wrong.
         self.assertIsNone(rendered_state(image))
+
+    def test_guest_state_marker_reports_placed_components(self):
+        image = Image.new('RGB', (640, 480), 'white')
+        pixels = image.load()
+        assert pixels is not None
+        payload = 2 | (1 << 9) | (1 << 22) | (1 << 23)
+        checksum = (payload ^ (payload >> 8) ^ (payload >> 16) ^ 0xa7) & 255
+        encoded = payload | (checksum << 24)
+        colors = [(255, 0, 255), (255, 255, 0), (0, 255, 255), (255, 0, 255)]
+        colors += [(255, 255, 255) if encoded & (1 << bit) else (0, 0, 0) for bit in range(32)]
+        for row in (473, 474):
+            for index, color in enumerate(colors):
+                pixels[6 + index * 2, row] = color
+        state = rendered_state(image)
+        assert state is not None
+        self.assertEqual((state['vertices'], state['edges']), (2, 1))
+        self.assertTrue(state['components'] and state['dirty'] and not state['shaded'])
 
     def test_dialog_occlusion_is_not_a_successful_edit(self):
         original = Image.new('RGB', (400, 300), 'black')

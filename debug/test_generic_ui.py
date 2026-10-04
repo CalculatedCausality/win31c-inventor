@@ -72,7 +72,8 @@ def rendered_state(image):
                 continue
             return {'vertices': low & 511, 'edges': (low >> 9) & 1023,
                     'units': (low >> 19) & 3, 'shaded': bool(low & (1 << 21)),
-                    'dirty': bool(low & (1 << 22))}
+                    'dirty': bool(low & (1 << 22)),
+                    'components': bool(low & (1 << 23))}
     return None
 
 
@@ -118,6 +119,24 @@ def surface_pixels(image):
     region = image.crop((182, 108, image.width - 145, image.height - 28))
     data = region.convert('RGB').tobytes()
     return sum(min(data[i:i + 3]) < 235 for i in range(0, len(data), 3))
+
+
+def component_pixels(image):
+    """Placed components: dark blue (0,0,160 -> VGA 0,0,168) or, when
+    selected, the 2px red selection pen. Empty documents draw neither."""
+    region = image.crop((182, 108, image.width - 145, image.height - 28))
+    data = region.convert('RGB').tobytes()
+    count = 0
+    for i in range(0, len(data), 3):
+        r, g, b = data[i], data[i + 1], data[i + 2]
+        if (b > 100 and r < 60 and g < 60) or (r > 120 and g < 80 and b < 80):
+            count += 1
+    return count
+
+
+async def state_is(page, name, predicate, timeout=70):
+    return await wait_screen(page, name, lambda text: text == 'yes', timeout=timeout,
+                             reader=lambda image: 'yes' if predicate(rendered_state(image) or {}, image) else 'no')
 
 
 async def main(headed=False, hold=False, windows=False):
@@ -186,6 +205,97 @@ async def main(headed=False, hold=False, windows=False):
             await wait_screen(page, 'generic-discard-demo', lambda text: 'save changes' in text)
             await keys(page, 'n$10')
             await counts(page, 'generic-empty-after-demo', 0, 0)
+            await progress(page, 'Parameters (fx): add W = 120 from the keyboard', headed)
+            await keys(page, '$altt$10p$10')
+            await wait_screen(page, 'params-dialog', lambda text: 'parameters' in text, title=True)
+            # The guest drops keys typed while a dialog is still painting.
+            await page.wait_for_timeout(2500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'W')
+            await page.wait_for_timeout(1000)
+            await keys(page, '$tab$10')
+            await page.wait_for_timeout(1000)
+            await page.evaluate('(text) => cadDebug.type(text)', '120')
+            await page.wait_for_timeout(1000)
+            await keys(page, '$enter$10')
+            # The new row is drawn selected (white on blue), which OCR cannot read;
+            # the dirty telemetry below proves the table changed.
+            await page.wait_for_timeout(2500)
+            (await frame(page)).save(OUTPUT / 'params-added.png')
+            await keys(page, '$esc$10')
+            # Parameters are document state: the empty document becomes dirty.
+            await wait_screen(page, 'params-dirty', lambda text: text == 'dirty',
+                              reader=lambda image: 'dirty' if (rendered_state(image) or {}).get('dirty') else 'clean')
+            await progress(page, 'Create a box whose Width field is the expression W', headed)
+            await keys(page, '$altc$10b$10')
+            await wait_screen(page, 'params-box-dialog', lambda text: 'create box' in text, title=True)
+            await page.wait_for_timeout(2500)
+            await keys(page, '$tab$10$tab$10$tab$10')
+            await page.wait_for_timeout(1000)
+            await page.evaluate('(text) => cadDebug.type(text)', 'W')
+            await page.wait_for_timeout(1000)
+            await keys(page, '$enter$10')
+            await counts(page, 'params-box-created', 8, 12)
+            await progress(page, 'Tools > Run Macro A:\\TABLE.CMD (one undoable group)', headed)
+            await keys(page, '$altt$10m$10')
+            await dialog(page, 'macro-open-dialog')
+            await page.wait_for_timeout(1500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'A:\\TABLE.CMD\r')
+            table = await counts(page, 'macro-table', 48, 72)
+            assert (rendered_state(table) or {}).get('units') == 1, rendered_state(table)
+            await keys(page, '$ctrlz$10')
+            undone = await counts(page, 'macro-undo-group', 8, 12)
+            assert (rendered_state(undone) or {}).get('units') == 0, rendered_state(undone)
+            await keys(page, '$ctrln$10')
+            await wait_screen(page, 'params-discard', lambda text: 'save changes' in text)
+            await keys(page, 'n$10')
+            await counts(page, 'generic-empty-after-macro', 0, 0)
+            await progress(page, 'Place Component: save a box as C:\\PART.CAD', headed)
+            await keys(page, '$altc$10b$10')
+            await wait_screen(page, 'parts-box-dialog', lambda text: 'create box' in text, title=True)
+            await keys(page, '$enter$10')
+            await counts(page, 'parts-box-created', 8, 12)
+            await keys(page, '$ctrls$10')
+            await dialog(page, 'parts-save-part-dialog')
+            await page.wait_for_timeout(1500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'C:\\PART.CAD\r')
+            await wait_screen(page, 'parts-part-saved', lambda text: 'part.cad' in text, title=True)
+            await keys(page, '$ctrln$10')
+            empty = await counts(page, 'parts-new-assembly', 0, 0)
+            assert not (rendered_state(empty) or {}).get('components'), rendered_state(empty)
+            assert component_pixels(empty) < 20, component_pixels(empty)
+            await progress(page, 'Insert > Place Component C:\\PART.CAD at X=200 (keyboard)', headed)
+            await keys(page, '$alti$10c$10')
+            await dialog(page, 'parts-place-open-dialog')
+            await page.wait_for_timeout(1500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'C:\\PART.CAD\r')
+            await wait_screen(page, 'parts-placement-dialog', lambda text: 'place component' in text, title=True)
+            await page.wait_for_timeout(2500)
+            await page.evaluate('(text) => cadDebug.type(text)', '200')
+            await page.wait_for_timeout(1000)
+            await keys(page, '$enter$10')
+            placed = await state_is(page, 'parts-placed', lambda state, image: state.get('components') and
+                                    state.get('dirty') and state.get('vertices') == 0 and component_pixels(image) > 100)
+            print(f'parts: placed component pixels={component_pixels(placed)}', flush=True)
+            await progress(page, 'Save the assembly as C:\\ASM.CAD, New, reopen it', headed)
+            await keys(page, '$ctrls$10')
+            await dialog(page, 'parts-save-asm-dialog')
+            await page.wait_for_timeout(1500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'C:\\ASM.CAD\r')
+            await wait_screen(page, 'parts-asm-saved', lambda text: 'asm.cad' in text, title=True)
+            await state_is(page, 'parts-asm-clean', lambda state, image: state.get('components') and not state.get('dirty'))
+            await keys(page, '$ctrln$10')
+            cleared = await state_is(page, 'parts-asm-closed', lambda state, image: state and not state.get('components') and
+                                     state.get('vertices') == 0 and component_pixels(image) < 20)
+            await keys(page, '$ctrlo$10')
+            await dialog(page, 'parts-open-asm-dialog')
+            await page.wait_for_timeout(1500)
+            await page.evaluate('(text) => cadDebug.type(text)', 'C:\\ASM.CAD\r')
+            reopened = await state_is(page, 'parts-asm-reopened', lambda state, image: state.get('components') and
+                                      not state.get('dirty') and state.get('vertices') == 0 and component_pixels(image) > 100)
+            await wait_screen(page, 'parts-asm-caption', lambda text: 'asm.cad' in text, title=True)
+            print(f'parts: reopened component pixels={component_pixels(reopened)} (closed={component_pixels(cleared)})', flush=True)
+            await keys(page, '$ctrln$10')
+            await counts(page, 'parts-empty-after-asm', 0, 0)
             await progress(page, 'Load Boeing 747-400 demo in shaded mode', headed)
             await keys(page, '$altd$10b$10')
             shaded_image = await counts(page, 'aircraft-loaded', 236, 396)

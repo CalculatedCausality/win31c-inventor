@@ -202,6 +202,190 @@ static void arbitrary_graph(void)
     input.next_vertex_id = input.next_edge_id = 65536L;
 }
 
+/* Extension text and caller buffers, all static (never on the stack). */
+static const char sample[] = "[PARAMS]\nw = 10 mm ~{}|\n\n !\"#$%&'()*+,-./\n";
+static char text[CAD_DOC_EXT_MAX + 2], out[CAD_DOC_EXT_MAX + 2],
+    out_before[CAD_DOC_EXT_MAX + 2];
+static unsigned char wire[CAD_DOC_WIRE_MAX + 1];
+static size_t wire_size;
+#define GEOMETRY (24 + 4 * 8 + 5 * 6)
+
+/* Load must fail with status and leave live, buffer and length untouched. */
+static void rejected_ex(int status, size_t n, int reseal, unsigned capacity)
+{
+    unsigned len = 777U;
+    if (reseal) seal(bad, n);
+    bytes_save("BAD.CAD", bad, n);
+    memcpy(&before, &live, sizeof(live));
+    memset(out, 0x5a, sizeof(out)); memcpy(out_before, out, sizeof(out));
+    CHECK(cad_document_load_ex("BAD.CAD", &live, &stage, out, capacity,
+                               &len) == status);
+    CHECK(!memcmp(&before, &live, sizeof(live)));
+    CHECK(!memcmp(out, out_before, sizeof(out)) && len == 777U);
+}
+/* Hand-built v1 file (good without the extension length) still loads. */
+static void version1(void)
+{
+    size_t n = good_size - 2;
+    unsigned len = 5U;
+    memcpy(bad, good, GEOMETRY); put16(bad + 4, 1); seal(bad, n);
+    memcpy(wire, bad, n);
+    bytes_save("V1.CAD", bad, n);
+    memset(&live, 0xa5, sizeof(live)); memset(out, 'x', 8);
+    CHECK(cad_document_load_ex("V1.CAD", &live, &stage, out, 8, &len) ==
+          CAD_DOC_OK);
+    same_geometry(&input, &live); CHECK(len == 0 && out[0] == 0 && out[1] == 'x');
+    memset(&live, 0xa5, sizeof(live));
+    CHECK(cad_document_load("V1.CAD", &live, &stage) == CAD_DOC_OK);
+    same_geometry(&input, &live);
+    CHECK(remove("V1.CAD") == 0);
+    for (n = 0; n < good_size - 2; ++n) {
+        memcpy(bad, wire, good_size - 2);
+        rejected_ex(CAD_DOC_FORMAT, n, 0, sizeof(out));
+    }
+    memcpy(bad, wire, good_size - 2); bad[good_size - 2] = 0;
+    rejected_ex(CAD_DOC_FORMAT, good_size - 1, 0, sizeof(out));
+}
+static void extension(void)
+{
+    FILE *f;
+    size_t n, len = sizeof(sample) - 1;
+    unsigned got, k;
+    static const char reject[] = "\r\t\0\177\200\377\033";
+    CHECK(cad_document_check_extension(sample, (unsigned)len) == CAD_DOC_OK);
+    CHECK(cad_document_check_extension(NULL, 0) == CAD_DOC_OK);
+    CHECK(cad_document_check_extension(NULL, 1) == CAD_DOC_FORMAT);
+    CHECK(cad_document_check_extension(text, CAD_DOC_EXT_MAX + 1U) ==
+          CAD_DOC_RANGE);
+    /* Stream round trip; NUL only when capacity exceeds the length. */
+    f = tmpfile(); CHECK(f != NULL);
+    CHECK(cad_document_write_ex(f, &input, sample, (unsigned)len) == CAD_DOC_OK);
+    rewind(f); memset(&live, 0xa5, sizeof(live)); memset(out, 'x', sizeof(out));
+    got = 0;
+    CHECK(cad_document_read_ex(f, &live, &stage, out, (unsigned)len, &got) ==
+          CAD_DOC_OK);
+    same_geometry(&input, &live);
+    CHECK(got == len && !memcmp(out, sample, len) && out[len] == 'x');
+    rewind(f); memset(out, 'x', sizeof(out)); got = 0;
+    CHECK(cad_document_read_ex(f, &live, &stage, out, (unsigned)len + 1U,
+                               &got) == CAD_DOC_OK);
+    CHECK(got == len && !strcmp(out, sample) && out[len + 1] == 'x');
+    /* Plain read and NULL buffer/length discard a valid extension. */
+    rewind(f); memset(&live, 0xa5, sizeof(live));
+    CHECK(cad_document_read(f, &live, &stage) == CAD_DOC_OK);
+    same_geometry(&input, &live);
+    rewind(f); got = 9;
+    CHECK(cad_document_read_ex(f, &live, &stage, NULL, 0, &got) == CAD_DOC_OK &&
+          got == len);
+    rewind(f);
+    CHECK(cad_document_read_ex(f, &live, &stage, NULL, 0, NULL) == CAD_DOC_OK);
+    /* Capacity too small: RANGE, nothing published (stream variant too). */
+    rewind(f); memcpy(&before, &live, sizeof(live)); memset(out, 'x', sizeof(out));
+    got = 9;
+    CHECK(cad_document_read_ex(f, &live, &stage, out, (unsigned)len - 1U,
+                               &got) == CAD_DOC_RANGE);
+    CHECK(!memcmp(&before, &live, sizeof(live)) && got == 9 && out[0] == 'x');
+    CHECK(fclose(f) == 0);
+    /* Disallowed bytes and oversize: ARG/RANGE before any output. */
+    f = tmpfile(); CHECK(f != NULL);
+    memcpy(text, sample, len);
+    for (k = 0; k < sizeof(reject) - 1; ++k) {
+        text[3] = reject[k];
+        CHECK(cad_document_write_ex(f, &input, text, (unsigned)len) ==
+              CAD_DOC_ARG && ftell(f) == 0);
+        CHECK(cad_document_check_extension(text, (unsigned)len) ==
+              CAD_DOC_FORMAT);
+    }
+    CHECK(cad_document_write_ex(f, &input, NULL, 1) == CAD_DOC_ARG &&
+          ftell(f) == 0);
+    memset(text, 'a', sizeof(text));
+    CHECK(cad_document_write_ex(f, &input, text, CAD_DOC_EXT_MAX + 1U) ==
+          CAD_DOC_RANGE && ftell(f) == 0);
+    CHECK(fclose(f) == 0);
+    text[0] = '\r';
+    CHECK(cad_document_save_ex("EXT.CAD", &input, text, 4) == CAD_DOC_ARG);
+    CHECK(cad_document_save_ex("EXT.CAD", &input, text, CAD_DOC_EXT_MAX + 1U)
+          == CAD_DOC_RANGE);
+    CHECK(doc_state("EXT.CAD") == 0 && doc_state("EXT.TMP") == 0);
+    /* Path round trip and exact wire layout. */
+    CHECK(cad_document_save_ex("EXT.CAD", &input, sample, (unsigned)len) ==
+          CAD_DOC_OK);
+    wire_size = bytes_load("EXT.CAD", wire);
+    CHECK(wire_size == good_size + len);
+    CHECK(!memcmp(wire, good, GEOMETRY));
+    CHECK(wire[GEOMETRY] == len && wire[GEOMETRY + 1] == 0);
+    CHECK(!memcmp(wire + GEOMETRY + 2, sample, len));
+    memcpy(bad, wire, wire_size); seal(bad, wire_size);
+    CHECK(!memcmp(bad, wire, wire_size));
+    memset(&live, 0xa5, sizeof(live)); memset(out, 'x', sizeof(out)); got = 0;
+    CHECK(cad_document_load_ex("EXT.CAD", &live, &stage, out, sizeof(out),
+                               &got) == CAD_DOC_OK);
+    same_geometry(&input, &live); CHECK(got == len && !strcmp(out, sample));
+    CHECK(cad_document_load("EXT.CAD", &live, &stage) == CAD_DOC_OK);
+    /* Overwrite keeps the extension semantics (empty plain save). */
+    CHECK(cad_document_save("EXT.CAD", &input) == CAD_DOC_OK);
+    CHECK(bytes_load("EXT.CAD", bad) == good_size && !memcmp(bad, good, good_size));
+    CHECK(remove("EXT.CAD") == 0);
+    /* Every truncation and trailing data; buffer and live untouched. */
+    for (n = 0; n < wire_size; ++n) {
+        memcpy(bad, wire, wire_size);
+        rejected_ex(CAD_DOC_FORMAT, n, 0, sizeof(out));
+    }
+    memcpy(bad, wire, wire_size); bad[wire_size] = '\n';
+    rejected_ex(CAD_DOC_FORMAT, wire_size + 1, 0, sizeof(out));
+    /* CRC detects corruption of the length and every text byte (unsealed). */
+    memcpy(bad, wire, wire_size); bad[GEOMETRY] ^= 1;
+    rejected_ex(CAD_DOC_FORMAT, wire_size, 0, sizeof(out));
+    for (n = GEOMETRY + 2; n < wire_size - 2; ++n) {
+        memcpy(bad, wire, wire_size);
+        bad[n] = (unsigned char)(bad[n] == 'A' ? 'B' : 'A');
+        rejected_ex(CAD_DOC_FORMAT, wire_size, 0, sizeof(out));
+    }
+    /* Disallowed stored bytes are FORMAT even with a valid CRC. */
+    for (k = 0; k < sizeof(reject) - 1; ++k) {
+        memcpy(bad, wire, wire_size);
+        bad[GEOMETRY + 2 + 5] = (unsigned char)reject[k];
+        rejected_ex(CAD_DOC_FORMAT, wire_size, 1, sizeof(out));
+    }
+    /* Stored length beyond 16384 is RANGE; length/size mismatch FORMAT. */
+    memcpy(bad, wire, wire_size); put16(bad + GEOMETRY, CAD_DOC_EXT_MAX + 1UL);
+    rejected_ex(CAD_DOC_RANGE, wire_size, 1, sizeof(out));
+    memcpy(bad, wire, wire_size); put16(bad + GEOMETRY, 65535UL);
+    rejected_ex(CAD_DOC_RANGE, wire_size, 1, sizeof(out));
+    memcpy(bad, wire, wire_size); put16(bad + GEOMETRY, len - 1);
+    rejected_ex(CAD_DOC_FORMAT, wire_size, 1, sizeof(out));
+    memcpy(bad, wire, wire_size); put16(bad + GEOMETRY, len + 1);
+    rejected_ex(CAD_DOC_FORMAT, wire_size, 1, sizeof(out));
+    /* Valid file, too small a buffer (including zero capacity). */
+    memcpy(bad, wire, wire_size);
+    rejected_ex(CAD_DOC_RANGE, wire_size, 0, (unsigned)len - 1U);
+    rejected_ex(CAD_DOC_RANGE, wire_size, 0, 0);
+    /* Invalid geometry beside a valid extension is still rejected. */
+    memcpy(bad, wire, wire_size); put16(bad + 26, 401UL);
+    rejected_ex(CAD_DOC_RANGE, wire_size, 1, sizeof(out));
+    /* Empty v2 extension with zero capacity buffer: OK, nothing written. */
+    memcpy(bad, good, good_size); bytes_save("BAD.CAD", bad, good_size);
+    out[0] = 'x'; got = 9;
+    CHECK(cad_document_load_ex("BAD.CAD", &live, &stage, out, 0, &got) ==
+          CAD_DOC_OK && got == 0 && out[0] == 'x');
+}
+/* Largest legal file: full graph plus 16384 bytes of text. */
+static void max_extension(void)
+{
+    unsigned got = 0, i;
+    for (i = 0; i < CAD_DOC_EXT_MAX; ++i)
+        text[i] = (char)(i % 64 == 63 ? '\n' : ' ' + i % 95);
+    CHECK(cad_document_save_ex("GRAPH.CAD", &input, text, CAD_DOC_EXT_MAX) ==
+          CAD_DOC_OK);
+    CHECK(bytes_load("GRAPH.CAD", bad) == CAD_DOC_WIRE_MAX);
+    memset(&live, 0xa5, sizeof(live)); memset(out, 'x', sizeof(out));
+    CHECK(cad_document_load_ex("GRAPH.CAD", &live, &stage, out,
+                               CAD_DOC_EXT_MAX, &got) == CAD_DOC_OK);
+    same_geometry(&input, &live);
+    CHECK(got == CAD_DOC_EXT_MAX && !memcmp(out, text, CAD_DOC_EXT_MAX) &&
+          out[CAD_DOC_EXT_MAX] == 'x');
+}
+
 int main(void)
 {
     unsigned int i;
@@ -214,8 +398,8 @@ int main(void)
     arbitrary_graph(); roundtrip();
     CHECK(cad_document_save("GRAPH.CAD", &input) == CAD_DOC_OK);
     good_size = bytes_load("GRAPH.CAD", good);
-    CHECK(good_size == 24 + 4 * 8 + 5 * 6 + 2);
-    CHECK(!memcmp(good, "CADG\001\000\002\000\004\000\005\000", 12));
+    CHECK(good_size == 24 + 4 * 8 + 5 * 6 + 2 + 2);
+    CHECK(!memcmp(good, "CADG\002\000\002\000\004\000\005\000", 12));
     CHECK(good[12] == 0 && good[13] == 0 && good[14] == 1 && good[15] == 0);
     CHECK(good[24] == 255 && good[25] == 255 &&
           good[26] == 0x70 && good[27] == 0xfe &&
@@ -232,7 +416,9 @@ int main(void)
     rejected(CAD_DOC_FORMAT, good_size, 0);
     memcpy(bad, good, good_size); bad[0] = 'X';
     rejected(CAD_DOC_FORMAT, good_size, 1);
-    memcpy(bad, good, good_size); put16(bad + 4, 2);
+    memcpy(bad, good, good_size); put16(bad + 4, 3);
+    rejected(CAD_DOC_FORMAT, good_size, 1);
+    memcpy(bad, good, good_size); put16(bad + 4, 0);
     rejected(CAD_DOC_FORMAT, good_size, 1);
     /* Valid CRC cannot conceal semantic/length failures. */
     memcpy(bad, good, good_size); put16(bad + 6, 3);
@@ -263,6 +449,7 @@ int main(void)
         memcpy(bad, good, good_size); put16(bad + 26, i ? 65135UL : 401UL);
         rejected(CAD_DOC_RANGE, good_size, 1);
     }
+    version1(); extension();
     memcpy(&before, &live, sizeof(live)); close_fail = 1;
     CHECK(cad_document_load("GRAPH.CAD", &live, &stage) == CAD_DOC_IO);
     CHECK(!memcmp(&before, &live, sizeof(live)));
@@ -386,11 +573,14 @@ int main(void)
     }
     input.next_vertex_id = 257L; input.next_edge_id = 513L;
     roundtrip(); CHECK(cad_document_save("GRAPH.CAD", &input) == CAD_DOC_OK);
-    CHECK(bytes_load("GRAPH.CAD", bad) == CAD_DOC_WIRE_MAX);
+    CHECK(bytes_load("GRAPH.CAD", bad) == CAD_DOC_WIRE_MAX_V1 + 2);
     CHECK(cad_document_load("GRAPH.CAD", &live, &stage) == CAD_DOC_OK);
     same_geometry(&input, &live);
     CHECK(doc_state("GRAPH.TMP") == 0 && doc_state("GRAPH.BAK") == 0);
-    CHECK(remove("GRAPH.CAD") == 0); CHECK(remove("BAD.CAD") == 0);
-    puts("document tests passed (graph, wire, atomic publication, recovery)");
+    CHECK(remove("BAD.CAD") == 0);
+    max_extension();
+    CHECK(remove("GRAPH.CAD") == 0);
+    puts("document tests passed (graph, wire v1/v2, extension, atomic "
+         "publication, recovery)");
     return 0;
 }

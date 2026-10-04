@@ -14,6 +14,12 @@ root = Path(__file__).resolve().parents[1]
 source = (root / "cad.c").read_text()
 
 
+def position(name):
+    match = re.search(r"static [^\n]+\b" + name + r"\([^;]*?\)\s*\{", source)
+    assert match, name
+    return match.start()
+
+
 def function(name):
     match = re.search(r"static [^\n]+\b" + name + r"\([^;]*?\)\s*\{", source)
     assert match, name
@@ -40,7 +46,12 @@ shim = r'''
 #include "cad_meshview.h"
 #include "cad_ui_ids.h"
 #include "cad_viewcube.h"
+#include "cad_userparams.h"
+#include "cad_vconstraints.h"
+#include "cad_script.h"
+#include "cad_parts.h"
 typedef int BOOL;
+#define NEAR
 typedef int HWND;
 typedef int HDC;
 typedef int HINSTANCE;
@@ -57,8 +68,10 @@ typedef unsigned int WPARAM;
 #define MB_ICONEXCLAMATION 0
 #define MB_YESNOCANCEL 0
 #define MB_ICONQUESTION 0
+#define MB_ICONINFORMATION 0
 #define IDYES 6
 #define IDNO 7
+#define IDOK 1
 #define IDCANCEL 2
 #define WM_CLOSE 16
 #define VK_ESCAPE 27
@@ -75,12 +88,21 @@ static int errors, changes, lines, mx, my, answer=IDNO, shift;
 static int textCalls;
 static int dialogOK=1;
 static char chosenPath[128]="TEST.CAD";
+static char lastMessage[512];
+static int dialogResult=1;
+static int ParametersDlg, DistanceDlg, PlacementDlg;
+/* Optional per-dialog hook: emulates the user editing dialog in/out globals. */
+static void (*dialogHook)(int id);
+#define IDD_PARAMETERS_SHIM 0
 static HWND GetCapture(void) { return capture; }
 static void ReleaseCapture(void) { capture=0; }
 static void InvalidateRect(HWND h,void *r,BOOL e) { (void)h;(void)r;(void)e; }
 static int MessageBox(HWND h,const char *s,const char *t,int f)
-{ (void)h;(void)t;(void)f; if (strncmp(s,"Save changes",12)) ++errors; return answer; }
-static void Changed(HWND h) { (void)h; ++changes; }
+{ (void)h;(void)t;(void)f; if (strncmp(s,"Save changes",12)) { ++errors; strncpy(lastMessage,s,511); } return answer; }
+static void SyncConstraints(void);
+static void Changed(HWND h) { (void)h; ++changes; SyncConstraints(); }
+/* Native modal dialogs: the test presets their in/out globals. */
+static int RunDialog(HWND h,FARPROC p,int id) { (void)h;(void)p; if (dialogHook) dialogHook(id); return dialogResult; }
 static void UpdateUI(HWND h) { (void)h; }
 static void SendMessage(HWND h,int m,int w,long l) { (void)h;(void)m;(void)w;(void)l; }
 static int GetKeyState(int k) { (void)k; return shift; }
@@ -100,7 +122,13 @@ names = ["ISin", "ICos", "VertexIndex", "MarkSaved", "Dirty", "ParseNumber",
          "ModelResult", "EndGesture", "MoveSelected", "ToCamera", "Fit", "BuildViewCube",
          "Project", "ClipTest", "CanvasLine", "WorldLine", "Materialize",
          "SheetLine", "SheetText", "DrawSheet", "HitTest", "MouseMove", "SaveDocument", "MayDiscard", "DeleteSelected",
-          "AircraftTopology", "Command", "Key"]
+          "AircraftTopology", "ParamText", "VcText", "ParseField", "VcMessage",
+          "SyncConstraints", "StageVertexMove", "BuildExtension", "ApplyExtension",
+          "ResetSelection", "ResetDocumentState", "AxisDelta", "CommitMoves",
+          "FinishConstraintEdit", "AddConstraint", "DistanceCommand", "HistorySignature",
+          "FollowUnits", "UndoRedo", "ParamLookup", "RunMacro", "Command", "Key",
+          "PartsText", "PartsMessage", "FitPoint", "ParseOffset", "ParseYaw",
+          "ComponentSegment", "ComponentCommand"]
 
 tests = r'''
 static void LineTo(HDC h,int x,int y)
@@ -119,6 +147,264 @@ static void BeginGrip(CadId target)
     startMouseX=100; startMouseY=100;
     assert(cad_model_begin(&model)==CAD_OK); gesture=G_GRIP; capture=1;
 }
+static CadVertex At(CadId id)
+{
+    CadVertex v;
+    assert(cad_model_get_vertex(&model,id,&v)==CAD_OK);
+    return v;
+}
+static void WriteText(const char *path,const char *text)
+{
+    FILE *file=fopen(path,"wb");
+    assert(file); fputs(text,file); assert(fclose(file)==0);
+}
+static void integration_tests(void)
+{
+    CadVertex v;
+    CadId a,b,c,d;
+    CadVConstraint record;
+    long value;
+    int history,count,oldErrors,vertices,edges;
+    answer=IDNO; dialogOK=1; capture=0;
+    Command(1,ID_FILE_NEW); assert(!model.vertex_count && !Dirty());
+    assert(!cad_userparams_count(&userParams) && !constraints.count);
+    /* Parameters: dialog fields take expressions; table changes are dirty. */
+    assert(cad_userparams_add(&userParams,"W","120",NULL,NULL)==CAD_UP_OK && Dirty());
+    assert(ParseField("W",&value) && value==120);
+    assert(ParseField(" W/2 + 10 ",&value) && value==70);
+    assert(ParseField("-400",&value) && value==-400);
+    assert(!ParseField("Nope+1",&value) && fieldError[0]);
+    assert(!ParseField("W*4",&value) && strstr(fieldError,"column"));
+    assert(!ParseField("10 mm",&value)); /* unspecified documents: no literals */
+    /* Units: parameters follow Tools > Units; mm literals block unspecified. */
+    Command(1,ID_TOOLS_MM); assert(model.units==CAD_UNITS_MM && cad_userparams_units(&userParams)==CAD_UNITS_MM);
+    assert(cad_userparams_add(&userParams,"T","1 cm",NULL,NULL)==CAD_UP_OK);
+    assert(ParseField("T*2",&value) && value==20);
+    oldErrors=errors; Command(1,ID_TOOLS_UNSPECIFIED);
+    assert(errors==oldErrors+1 && model.units==CAD_UNITS_MM && cad_userparams_units(&userParams)==CAD_UNITS_MM);
+    history=model.history_cursor; oldErrors=errors; Command(1,ID_EDIT_UNDO); /* undo of units refused too */
+    assert(errors==oldErrors+1 && model.units==CAD_UNITS_MM && model.history_cursor==history);
+    assert(cad_userparams_remove(&userParams,cad_userparams_find(&userParams,"T"),NULL)==CAD_UP_OK);
+    Command(1,ID_EDIT_UNDO); assert(model.units==CAD_UNITS_UNSPECIFIED && cad_userparams_units(&userParams)==CAD_UNITS_UNSPECIFIED);
+    /* Constraints: two lines, align X moves the second vertex in one command. */
+    assert(cad_create_line(&model,0,0,0,50,0,0)==CAD_OK);
+    assert(cad_create_line(&model,10,40,0,90,40,0)==CAD_OK);
+    a=model.vertices[0].id; b=model.vertices[1].id; c=model.vertices[2].id; d=model.vertices[3].id;
+    selected=a; selected2=c; history=model.history_cursor;
+    AddConstraint(1,CAD_VC_ALIGN,0,0);
+    assert(constraints.count==1 && selectedConstraint && model.history_cursor==history+1);
+    assert(At(c).x==At(a).x && At(c).y==40);
+    /* Arrow nudge and Properties move the partner in the same transaction. */
+    selected=a; selected2=0; history=model.history_cursor;
+    assert(Key(1,VK_RIGHT)); assert(model.history_cursor==history+1 && At(a).x==1 && At(c).x==1);
+    assert(MoveSelected(-30,0,0)==CAD_OK && At(c).x==-30 && At(c).y==40);
+    /* Grip drag: one commit, partner follows during preview. */
+    yaw=0; pitch=0; scale=1; focal=1024; snap=FALSE; history=model.history_cursor;
+    BeginGrip(a); MouseMove(1,120,100); assert(At(c).x==-10 && model.history_cursor==history);
+    EndGesture(1,TRUE); assert(model.history_cursor==history+1 && At(c).x==-10);
+    /* Fix: a fixed group refuses to move and explains why. */
+    selected=c; AddConstraint(1,CAD_VC_FIX,0,0); assert(constraints.count==2);
+    selected=a; history=model.history_cursor; oldErrors=errors;
+    assert(MoveSelected(5,0,0)!=CAD_OK); ModelResult(1,CAD_RANGE);
+    assert(model.history_cursor==history && At(a).x==-10 && errors==oldErrors+1 && strstr(lastMessage,"fixed"));
+    BeginGrip(a); MouseMove(1,140,100); assert(!gesture && At(a).x==-10 && !model.transaction_active);
+    /* Distance between b and d (dialog preset), then edit via the browser record. */
+    selected=b; selected2=d; selectedConstraint=0; distanceAxis=1; dialogResult=IDOK;
+    DistanceCommand(1); /* proposes current Y delta (40) */
+    assert(constraints.count==3 && cad_vc_get(&constraints,selectedConstraint,&record)==CAD_VC_OK);
+    assert(record.kind==CAD_VC_DISTANCE && record.axis==0 && record.offset==At(d).x-At(b).x);
+    selected=selected2=0; DistanceCommand(1); /* editing keeps value */
+    assert(cad_vc_get(&constraints,record.id,&record)==CAD_VC_OK && record.offset==At(d).x-At(b).x);
+    /* Undo of geometry leaves records; sync marks unmet ones Sick, redo heals. */
+    selectedConstraint=0; selected=b; history=model.history_cursor;
+    assert(MoveSelected(60,0,0)==CAD_OK && At(d).x-At(b).x==record.offset);
+    Command(1,ID_EDIT_UNDO); Command(1,ID_EDIT_UNDO);
+    count=0; for (value=0; value<constraints.count; ++value) count+=constraints.items[value].health==CAD_VC_SICK;
+    assert(constraints.count==3 && count>=1);
+    Command(1,ID_EDIT_REDO); Command(1,ID_EDIT_REDO);
+    count=0; for (value=0; value<constraints.count; ++value) count+=constraints.items[value].health==CAD_VC_SICK;
+    assert(count==0);
+    /* Save/load round trip includes [PARAMS] and [CONSTRAINTS]; dirty tracks them. */
+    strcpy(chosenPath,"CONS.CAD"); filePath[0]=0; assert(SaveDocument(1,FALSE) && !Dirty());
+    selectedConstraint=constraints.items[0].id; selected=selectedEdge=0;
+    DeleteSelected(1); assert(constraints.count==2 && Dirty());
+    vertices=model.vertex_count; edges=model.edge_count;
+    Command(1,ID_FILE_NEW); assert(!constraints.count && !cad_userparams_count(&userParams));
+    Command(1,ID_FILE_OPEN);
+    assert(model.vertex_count==vertices && model.edge_count==edges && constraints.count==3);
+    assert(cad_userparams_count(&userParams)==1 && !Dirty() && !strcmp(filePath,"CONS.CAD"));
+    /* Deleting a constrained vertex drops its records (sync after delete). */
+    selected=c; selectedEdge=0; DeleteSelected(1); assert(constraints.count==1);
+    Command(1,ID_EDIT_UNDO); assert(VertexIndex(c)>=0 && constraints.count==1);
+    /* Unknown/malformed sections are rejected atomically. */
+    assert(cad_document_save_ex("BADEXT.CAD",&model,"[PARAMS]\nP Q 5\n[PARTS]\nX\n",strlen("[PARAMS]\nP Q 5\n[PARTS]\nX\n"))==CAD_DOC_OK);
+    strcpy(chosenPath,"BADEXT.CAD"); answer=IDNO; oldErrors=errors; count=constraints.count;
+    Command(1,ID_FILE_OPEN);
+    assert(errors>oldErrors && strstr(lastMessage,"PARTS") && !strcmp(filePath,"CONS.CAD"));
+    assert(constraints.count==count && !cad_userparams_find(&userParams,"Q"));
+    assert(cad_document_save_ex("BADEXT.CAD",&model,"[PARAMS]\nP Q W+\n",strlen("[PARAMS]\nP Q W+\n"))==CAD_DOC_OK);
+    oldErrors=errors; Command(1,ID_FILE_OPEN); assert(errors>oldErrors && !cad_userparams_find(&userParams,"Q"));
+    assert(cad_document_save_ex("BADEXT.CAD",&model,"[CONSTRAINTS]\nN 1\n[CONSTRAINTS]\nN 1\n",strlen("[CONSTRAINTS]\nN 1\n[CONSTRAINTS]\nN 1\n"))==CAD_DOC_OK);
+    oldErrors=errors; Command(1,ID_FILE_OPEN); assert(errors>oldErrors && strstr(lastMessage,"Duplicate"));
+    /* Plain v1-style (no extension) documents load with empty tables. */
+    assert(cad_document_save("PLAIN.CAD",&model)==CAD_DOC_OK);
+    strcpy(chosenPath,"PLAIN.CAD"); answer=IDNO; Command(1,ID_FILE_OPEN);
+    assert(!constraints.count && !cad_userparams_count(&userParams) && !Dirty());
+    /* Macros: all-or-nothing, parameters resolve, one Undo reverts all. */
+    Command(1,ID_FILE_NEW);
+    assert(cad_userparams_add(&userParams,"PW","25.4",NULL,NULL)==CAD_UP_OK);
+    WriteText("PBOX.CMD","CADSCRIPT 1\nBOX 0 0 0 PW PW PW*2\nLINE 0 0 0 1 1 1\n");
+    strcpy(chosenPath,"PBOX.CMD"); history=model.history_cursor; RunMacro(1);
+    assert(model.vertex_count==10 && model.edge_count==13 && model.history_cursor==history+2);
+    for (value=0; value<(long)model.vertex_count; ++value) {
+        v=model.vertices[value]; assert(v.x==0 || v.x==25 || v.x==1);
+        assert(v.z==0 || v.z==50 || v.z==1);
+    }
+    Command(1,ID_EDIT_UNDO); assert(!model.vertex_count && model.history_cursor==history);
+    Command(1,ID_EDIT_REDO); assert(model.vertex_count==10 && model.edge_count==13);
+    Command(1,ID_EDIT_UNDO); assert(!model.vertex_count);
+    WriteText("BAD.CMD","CADSCRIPT 1\nBOX 0 0 0 10 10 10\nBOX 0 0 0 0 10 10\n");
+    strcpy(chosenPath,"BAD.CMD"); oldErrors=errors; RunMacro(1);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"line 3") && !model.vertex_count);
+    WriteText("UNK.CMD","CADSCRIPT 1\nBOX 0 0 0 NOPE 10 10\n");
+    strcpy(chosenPath,"UNK.CMD"); oldErrors=errors; RunMacro(1);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"line 2") && !model.vertex_count);
+    assert(cad_create_line(&model,0,0,0,5,5,5)==CAD_OK);
+    vertices=model.vertex_count; edges=model.edge_count;
+    strcpy(chosenPath,TABLE_PATH); RunMacro(1);
+    assert(model.vertex_count==vertices+40 && model.edge_count==edges+60 && model.units==CAD_UNITS_MM);
+    assert(cad_userparams_units(&userParams)==CAD_UNITS_MM);
+    Command(1,ID_EDIT_UNDO);
+    assert(model.vertex_count==vertices && model.edge_count==edges && model.units==CAD_UNITS_UNSPECIFIED);
+    assert(cad_userparams_units(&userParams)==CAD_UNITS_UNSPECIFIED);
+    Command(1,ID_EDIT_REDO); assert(model.vertex_count==vertices+40);
+    /* Any later edit invalidates the group: Undo is one command again. */
+    Command(1,ID_EDIT_UNDO); Command(1,ID_EDIT_REDO);
+    selected=model.vertices[0].id; assert(MoveSelected(7,7,7)==CAD_OK);
+    Command(1,ID_EDIT_UNDO); assert(model.vertex_count==vertices+40);
+    Command(1,ID_EDIT_UNDO); assert(model.vertex_count==vertices+32);
+}
+static long hookPlace[4];
+static void PlaceHook(int id)
+{
+    if (id==IDD_PLACEMENT) memcpy(placeValues,hookPlace,sizeof(hookPlace));
+}
+static CadPartsInfo Component(unsigned index)
+{
+    CadAssemblyId id;
+    CadPartsInfo info;
+    assert(cad_parts_at(&parts,index,&id)==CAD_PARTS_OK);
+    assert(cad_parts_get(&parts,id,&info)==CAD_PARTS_OK);
+    return info;
+}
+static void Place(const char *path,long x,long y,long z,long yawIndex)
+{
+    strcpy(chosenPath,path);
+    hookPlace[0]=x; hookPlace[1]=y; hookPlace[2]=z; hookPlace[3]=yawIndex;
+    dialogResult=IDOK; dialogHook=PlaceHook;
+    Command(1,ID_INSERT_PLACE);
+    dialogHook=NULL;
+}
+static void parts_tests(void)
+{
+    CadPartsInfo info;
+    long value;
+    int history,oldErrors,oldLines;
+    unsigned count;
+    HDC dc=1;
+    answer=IDNO; dialogOK=1; capture=0; dialogResult=IDOK;
+    /* Offsets: integers +-2000, expressions in the model range; yaw degrees. */
+    assert(ParseOffset("2000",&value) && value==2000);
+    assert(ParseOffset(" -2000 ",&value) && value==-2000);
+    assert(!ParseOffset("2001",&value) && strstr(fieldError,"2000"));
+    assert(!ParseOffset("99999999999999999999",&value));
+    assert(ParseYaw("90",&value) && value==2);
+    assert(ParseYaw("-45",&value) && value==7);
+    assert(ParseYaw("360",&value) && value==0);
+    assert(!ParseYaw("30",&value) && strstr(fieldError,"45"));
+    /* A part: one box saved as PART.CAD. */
+    Command(1,ID_FILE_NEW);
+    assert(cad_create_box(&model,0,0,0,100,100,100)==CAD_OK);
+    strcpy(chosenPath,"PART.CAD"); filePath[0]=0; assert(SaveDocument(1,FALSE) && !Dirty());
+    Command(1,ID_FILE_NEW); assert(!cad_parts_count(&parts) && !Dirty());
+    /* Place at X=200, yaw 90: not a model undo step, but the document is dirty. */
+    assert(cad_userparams_add(&userParams,"OFF","20",NULL,NULL)==CAD_UP_OK);
+    MarkSaved();
+    assert(cad_create_line(&model,0,0,0,10,0,0)==CAD_OK);
+    history=model.history_cursor; MarkSaved();
+    Place("PART.CAD",200,0,0,2);
+    assert(cad_parts_count(&parts)==1 && selectedComponent && Dirty());
+    assert(model.history_cursor==history && model.vertex_count==2);
+    info=Component(0);
+    assert(!strcmp(info.name,"PART:1") && !info.missing && info.vertex_count==8 && info.edge_count==12);
+    assert(info.tx==200 && info.yaw==2 && !info.grounded && !strcmp(info.path,"PART.CAD"));
+    /* Zoom all covers the line and the rotated box (x 200..300, z -100..0). */
+    canvasWidth=586; canvasHeight=496; yaw=32; pitch=24; Fit();
+    assert(centerX==150 && centerY==50 && centerZ==-50 && focal>=1);
+    /* Component edges are clipped in floating point even far off screen. */
+    lines=0; assert(cad_parts_segments(&parts,0,ComponentSegment,&dc)==CAD_PARTS_OK && lines>0);
+    Place("PART.CAD",2000,-2000,2000,1);
+    info=Component(1); assert(cad_parts_count(&parts)==2 && !strcmp(info.name,"PART:2"));
+    scale=8; focal=8192; oldLines=lines;
+    assert(cad_parts_segments(&parts,0,ComponentSegment,&dc)==CAD_PARTS_OK && lines>=oldLines);
+    Fit(); assert(centerX>1000 && focal>=1);
+    /* Undo moves geometry only; components stay. */
+    Command(1,ID_EDIT_UNDO); assert(!model.vertex_count && cad_parts_count(&parts)==2);
+    Command(1,ID_EDIT_REDO); assert(model.vertex_count==2);
+    /* Remove via Del on a selected component row. */
+    selectedComponent=Component(1).id; selected=selectedEdge=0; selectedConstraint=0;
+    Command(1,ID_EDIT_DELETE); assert(cad_parts_count(&parts)==1 && !selectedComponent);
+    Command(1,ID_EDIT_UNDO); assert(cad_parts_count(&parts)==1);
+    Command(1,ID_EDIT_REDO);
+    /* Ground blocks Move; unground, then Move with an expression offset. */
+    selectedComponent=Component(0).id;
+    Command(1,ID_INSERT_GROUND); assert(Component(0).grounded);
+    oldErrors=errors; hookPlace[0]=1; dialogHook=PlaceHook;
+    Command(1,ID_INSERT_MOVE);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"grounded") && Component(0).tx==200);
+    Command(1,ID_INSERT_GROUND); assert(!Component(0).grounded);
+    assert(ParseOffset("OFF*2+10",&value) && value==50);
+    hookPlace[0]=value; hookPlace[1]=10; hookPlace[2]=-20; hookPlace[3]=1;
+    Command(1,ID_INSERT_MOVE); dialogHook=NULL;
+    info=Component(0); assert(info.tx==50 && info.ty==10 && info.tz==-20 && info.yaw==1);
+    /* Without a selection the component commands explain themselves. */
+    selectedComponent=0; oldErrors=errors; Command(1,ID_INSERT_REMOVE);
+    assert(errors==oldErrors+1 && cad_parts_count(&parts)==1);
+    /* Save writes [PARTS]; dirty tracks ground/move; reopen restores all. */
+    strcpy(chosenPath,"ASM.CAD"); filePath[0]=0; assert(SaveDocument(1,FALSE) && !Dirty());
+    selectedComponent=Component(0).id; Command(1,ID_INSERT_GROUND); assert(Dirty());
+    Command(1,ID_INSERT_GROUND); assert(!Dirty());
+    Command(1,ID_FILE_NEW); assert(!cad_parts_count(&parts) && !selectedComponent);
+    strcpy(chosenPath,"ASM.CAD"); Command(1,ID_FILE_OPEN);
+    assert(cad_parts_count(&parts)==1 && !Dirty() && !strcmp(filePath,"ASM.CAD"));
+    info=Component(0);
+    assert(info.tx==50 && info.ty==10 && info.tz==-20 && info.yaw==1 && info.vertex_count==8);
+    assert(model.vertex_count==2 && cad_userparams_find(&userParams,"OFF"));
+    /* A [PARTS] failure after a valid [PARAMS] keeps the whole document,
+     * including the previous parameter table. */
+    assert(cad_document_save_ex("BADPARTS.CAD",&model,"[PARAMS]\nP Q 5\n[PARTS]\nN 1\nO 1 0 0 0 0 0 X\n",
+        strlen("[PARAMS]\nP Q 5\n[PARTS]\nN 1\nO 1 0 0 0 0 0 X\n"))==CAD_DOC_OK);
+    strcpy(chosenPath,"BADPARTS.CAD"); oldErrors=errors; Command(1,ID_FILE_OPEN);
+    assert(errors==oldErrors+1 && strstr(lastMessage,"[PARTS] line 2") && !strcmp(filePath,"ASM.CAD"));
+    assert(cad_userparams_find(&userParams,"OFF") && !cad_userparams_find(&userParams,"Q"));
+    assert(cad_parts_count(&parts)==1 && Component(0).tx==50 && !Dirty());
+    /* Missing part files: placed without geometry, reload retries. */
+    remove("LATER.CAD");
+    oldErrors=errors; Place("LATER.CAD",0,0,0,0);
+    assert(errors==oldErrors+1 && cad_parts_count(&parts)==2 && Component(1).missing);
+    count=0; assert(cad_parts_segments(&parts,Component(1).id,ComponentSegment,&dc)==CAD_PARTS_OK);
+    oldErrors=errors; Command(1,ID_INSERT_RELOAD); assert(errors==oldErrors+1 && Component(1).missing);
+    assert(cad_document_save("LATER.CAD",&model)==CAD_DOC_OK);
+    oldErrors=errors; Command(1,ID_INSERT_RELOAD);
+    assert(errors==oldErrors && !Component(1).missing && Component(1).vertex_count==2);
+    /* A cancelled placement dialog changes nothing. */
+    dialogResult=IDCANCEL; strcpy(chosenPath,"PART.CAD"); dialogHook=PlaceHook;
+    Command(1,ID_INSERT_PLACE); dialogHook=NULL; dialogResult=IDOK;
+    assert(cad_parts_count(&parts)==2);
+    /* Demo and New reset components. */
+    Command(1,ID_DEMO_HOUSE); assert(!cad_parts_count(&parts) && model.vertex_count==30);
+    (void)count;
+}
 int main(void)
 {
     CadVertex v,before,other;
@@ -128,7 +414,7 @@ int main(void)
     long value=99;
     CadSketchPoint points[12];
     FILE *file;
-    assert(cad_model_init(&model)==CAD_OK); cad_model_init(&stage); MarkSaved();
+    assert(cad_model_init(&model)==CAD_OK); cad_model_init(&stage); ResetDocumentState(); MarkSaved();
     assert(!model.vertex_count && !model.edge_count && !Dirty());
     width=760;height=520;canvasWidth=586;canvasHeight=496; Fit(); Project();
     assert(focal>=1 && HitTest(10,10)==-1 && Materialize());
@@ -263,7 +549,9 @@ int main(void)
     assert(cad_model_delete_vertex(&model,1)==CAD_OK);
     assert(!AircraftTopology());
     assert(cad_model_cancel(&model)==CAD_OK && AircraftTopology());
-    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands passed");
+    integration_tests();
+    parts_tests();
+    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands, components passed");
     return 0;
 }
 '''
@@ -272,14 +560,19 @@ with tempfile.TemporaryDirectory(prefix="cad-editor-") as temp:
     temp = Path(temp)
     c = temp / "controller.c"
     sheet_type = source[source.index("typedef struct SheetContext"):source.index("static int SheetLine")]
-    c.write_text(shim + defines + globals_ + sheet_type + "".join(function(n) for n in names) + tests)
+    (temp / "TABLE.CMD").write_bytes((root / "examples" / "TABLE.CMD").read_bytes())
+    c.write_text('#define TABLE_PATH "TABLE.CMD"\n' + shim + defines + globals_ + sheet_type +
+                 "".join(function(n) for n in sorted(names, key=position)) + tests)
     executable = temp / "controller"
     flags = ["-std=c89", "-pedantic", "-Wall", "-Wextra", "-Wno-unused-variable"]
     if os.environ.get("CAD_EDITOR_SANITIZE"):
         flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
     subprocess.run(["cc", *flags, "-I", str(root), str(c),
                     *(str(root / f) for f in ["cad_model.c", "cad_create.c", "cad_sketch.c",
-                                             "cad_document.c", "cad_export.c", "cad_drawing.c", "cad_aircraft.c", "cad_viewcube.c"]),
+                                             "cad_document.c", "cad_export.c", "cad_drawing.c", "cad_aircraft.c", "cad_viewcube.c",
+                                             "cad_params.c", "cad_userparams.c", "cad_constraints.c",
+                                             "cad_vconstraints.c", "cad_script.c",
+                                             "cad_assembly.c", "cad_parts.c"]),
                     "-o", str(executable)], check=True)
     subprocess.run([str(executable)], cwd=temp, check=True)
 
@@ -290,6 +583,8 @@ assert re.search(r"case ID_DEMO_HOUSE:\s*if \(!MayDiscard\(hwnd\)\) return;", so
 resources = (root / "cad.rc").read_text()
 for command in ["ID_FILE_NEW", "ID_FILE_OPEN", "ID_FILE_SAVE", "ID_FILE_SAVEAS",
                 "ID_EDIT_UNDO", "ID_EDIT_REDO", "ID_CREATE_LINE", "ID_CREATE_RECTANGLE",
-                "ID_CREATE_BOX", "ID_CREATE_EXTRUDE", "ID_DEMO_HOUSE"]:
+                "ID_CREATE_BOX", "ID_CREATE_EXTRUDE", "ID_DEMO_HOUSE", "ID_INSERT_PLACE",
+                "ID_INSERT_MOVE", "ID_INSERT_GROUND", "ID_INSERT_REMOVE", "ID_INSERT_RELOAD",
+                "IDD_PLACEMENT"]:
     assert command in resources
 print("cad editor: empty startup, guarded optional demo and native menu resource checks passed")

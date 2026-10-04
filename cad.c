@@ -15,6 +15,10 @@
 #include "cad_aircraft.h"
 #include "cad_meshview.h"
 #include "cad_viewcube.h"
+#include "cad_userparams.h"
+#include "cad_vconstraints.h"
+#include "cad_script.h"
+#include "cad_parts.h"
 #include "cad_ui_ids.h"
 
 #define SIDE_WIDTH 154
@@ -30,9 +34,76 @@
 #define G_ORBIT 2
 #define G_CUBE 3
 #define TIMER_CAPTURE 1
+#define PICK_MACRO (-2)
+/* Browser item data: vertex ID, 0x10000|edge ID, header, 0x80000000|constraint,
+ * 0x20000000|component occurrence ID. */
+#define BROWSER_EDGE 0x10000UL
+#define BROWSER_COMPONENT 0x20000000UL
+#define BROWSER_HEADER 0x40000000UL
+#define BROWSER_CONSTRAINT 0x80000000UL
+
+#define SECTION_TEXT (CAD_VC_TEXT_MAX + 1)
+#define EXT_BYTES (CAD_DOC_EXT_MAX + 1)
 
 static CadModel model;
 static CadModel stage;
+/* Load target / script rollback copy; never the live document. */
+static CadModel spare;
+/* Document state outside CadModel. Parameter and constraint records are not
+ * part of model undo history: undo moves geometry only, after which
+ * cad_vc_sync marks constraints the geometry no longer satisfies as Sick. */
+static CadUserParams userParams;
+static CadVConstraints constraints;
+static CadVConstraints loadConstraints;
+static CadVcMoves vcMoves;
+static CadVcStatus vcFailure;
+static char savedParamText[SECTION_TEXT], savedVcText[SECTION_TEXT];
+static char sectionScratch[SECTION_TEXT];
+static char extText[EXT_BYTES];
+/* Placed components (Insert > Place Component). Only one live CadParts may
+ * exist per process (cad_parts.c owns the part models, ~4 KiB here). Component
+ * edits are document state but not model undo steps (like constraints). */
+static CadParts parts;
+static char savedPartsText[CAD_PARTS_TEXT_MAX + 1];
+static CadAssemblyId selectedComponent;
+/* Placement dialog in/out: offsets, yaw index 0..7; path shown read-only. */
+static long placeValues[4];
+static const char *placePath;
+/* Undo group for one macro run: valid only while the history signature is
+ * exactly the one recorded right after the run (kind 1) or its group undo
+ * (kind 2). Any other edit, undo or redo invalidates it. */
+static int groupKind;
+static unsigned groupCount;
+static unsigned long groupSignature;
+static char fieldError[96];
+/* Distance dialog in/out: axis 0..2, value, editing an existing record. */
+static int distanceAxis;
+static BOOL distanceEditing;
+static long distanceValue;
+/* C89 limits single string literals to 509 bytes; join at run time. */
+static const char *const NEAR aboutText[] = {
+    "Wireframe CAD: lines, XY rectangles, boxes, polygon extrusions.\n\n",
+    "Select in browser; drag vertex grips. Right-drag orbits.\n",
+    "Arrows: selected X/Z; PgUp/PgDn: Y; Tab: next vertex.\n",
+    "Enter: coordinates; Esc: cancel drag / clear selection.\n\n",
+    "Parameters (fx): Tools or Manage tab. Dialog fields accept\n",
+    "expressions such as W/2+10 (mm/cm/in literals in mm documents).\n",
+    "Constraints: click a vertex, Ctrl/Shift+click a second, then\n",
+    "Edit > Constrain or the Constrain tab (Coincident, Align X/Y/Z,\n",
+    "Distance, Fix). Moves keep constraints; undo can leave them Sick (red).\n",
+    "Delete a constraint from the browser. Glyphs: C A D F.\n",
+    "Run Macro: .CMD scripts (all-or-nothing; one Undo reverts them).\n",
+    "Insert > Place Component references saved .CAD parts (blue);\n",
+    "select one in the browser to move/ground/remove (Del).\n\n",
+    "256 vertices / 512 edges; coordinates +/-400.\n",
+    "Undo: 32 commands / 1024 deltas; operation: 64 deltas.\n",
+    "31 parameters; 64 constraints over at most 40 vertices.\n",
+    "16 components / 4 part files; offsets +/-2000, yaw 45 deg steps.\n",
+    "Parameter/constraint/component edits are saved but are not undo steps.\n",
+    "DXF/OBJ: wireframe only. No curved kernel or feature tree.",
+    NULL
+};
+static char about[1280];
 /* Exact saved geometry, independent of history eviction and load scratch.
  * Compare by ID, not dense order, and ignore allocator/history metadata. */
 static CadVertex savedVertices[CAD_MAX_VERTICES];
@@ -49,15 +120,20 @@ static HWND browser;
 static FARPROC browserThunk, dialogThunk;
 static WNDPROC oldBrowserProc;
 static BOOL captureTimer;
-static HPEN edgePen, gridPen, selectedPen;
-static HBRUSH hotBrush;
+static HPEN edgePen, gridPen, selectedPen, componentPen;
+static HBRUSH hotBrush, secondBrush;
 static char filePath[PATH_BYTES];
-static CadId selected, selectedEdge;
+/* selected2: second vertex (Ctrl/Shift+click) for two-vertex constraints. */
+static CadId selected, selectedEdge, selected2;
+static CadVcId selectedConstraint;
 static int width, height, canvasWidth, canvasHeight;
-static int yaw = 32, pitch = 24;
-static BOOL sheetView, showGrid = TRUE, snap;
-static double scale = 1.0, centerX, centerY, centerZ;
-static long focal = 1; /* Orthographic pixel scale * 1024; always positive. */
+static int NEAR yaw = 32;
+static int NEAR pitch = 24;
+static BOOL sheetView, snap;
+static BOOL NEAR showGrid = TRUE;
+static double NEAR scale = 1.0;
+static double centerX, centerY, centerZ;
+static long NEAR focal = 1; /* Orthographic pixel scale * 1024; always positive. */
 static int px[CAD_MAX_VERTICES], py[CAD_MAX_VERTICES];
 static BOOL visible[CAD_MAX_VERTICES];
 static int gesture, startMouseX, startMouseY, startYaw, startPitch;
@@ -80,7 +156,7 @@ static HBRUSH aircraftBrushes[CAD_AIRCRAFT_MATERIAL_COUNT * 8];
 static CadMeshViewVertex meshVertices[CAD_AIRCRAFT_MAX_VERTICES];
 static CadMeshViewFace meshFaces[CAD_AIRCRAFT_MAX_TRIANGLES];
 
-static const int quarter[65] = {
+static const int NEAR quarter[65] = {
     0,25,50,75,100,125,150,175,200,224,249,273,297,321,345,369,
     392,415,438,460,483,505,526,548,569,590,610,630,650,669,688,707,
     724,742,759,775,792,807,822,836,851,865,878,891,903,915,926,936,
@@ -105,8 +181,40 @@ static int VertexIndex(CadId id)
         if (model.vertices[i].id == id) return i;
     return -1;
 }
+/* Serialized section bodies (without headers), NUL-terminated. Both writers
+ * are bounded to 4096 bytes by their modules, so failure is not expected. */
+static unsigned ParamText(char *buffer)
+{
+    unsigned length = 0;
+    if (cad_userparams_write_text(&userParams, buffer, SECTION_TEXT, &length) != CAD_UP_OK)
+        length = 0;
+    buffer[length] = 0;
+    return length;
+}
+static unsigned VcText(char *buffer)
+{
+    unsigned length = 0;
+    if (cad_vc_write_text(&constraints, buffer, SECTION_TEXT, &length) != CAD_VC_OK)
+        length = 0;
+    buffer[length] = 0;
+    return length;
+}
+/* Component records; "" when none are placed (no [PARTS] section is
+ * written then, so plain part files stay readable by older builds). */
+static unsigned PartsText(char *buffer)
+{
+    unsigned length = 0;
+    if (!cad_parts_count(&parts) ||
+        cad_parts_write_text(&parts, buffer, CAD_PARTS_TEXT_MAX, &length) != CAD_PARTS_OK)
+        length = 0;
+    buffer[length] = 0;
+    return length;
+}
 static void MarkSaved(void)
 {
+    ParamText(savedParamText);
+    VcText(savedVcText);
+    PartsText(savedPartsText);
     savedVertexCount = model.vertex_count;
     savedEdgeCount = model.edge_count;
     savedUnits = model.units;
@@ -129,7 +237,12 @@ static BOOL Dirty(void)
         if (cad_model_get_edge(&model, savedEdges[i].id, &e) != CAD_OK ||
             e.a != savedEdges[i].a || e.b != savedEdges[i].b) return TRUE;
     }
-    return FALSE;
+    ParamText(sectionScratch);
+    if (strcmp(sectionScratch, savedParamText)) return TRUE;
+    VcText(sectionScratch);
+    if (strcmp(sectionScratch, savedVcText)) return TRUE;
+    PartsText(sectionScratch);
+    return strcmp(sectionScratch, savedPartsText) != 0;
 }
 
 /* Strict bounded ASCII integer parsing; strtol overflow is never invoked.
@@ -155,6 +268,35 @@ static int ParseNumber(const char **text, long *value)
 static int ParseCoordinate(const char *text, long *value)
 {
     return ParseNumber(&text, value) && !*text;
+}
+/* Dialog fields: plain integers, else a Parameters (fx) expression such as
+ * "W/2 + 10" evaluated in document units and rounded to a model coordinate. */
+static int ParseField(const char *text, long *value)
+{
+    CadUserParamError error;
+    if (ParseCoordinate(text, value)) return 1;
+    if (cad_userparams_eval_expression(&userParams, text, value, &error) == CAD_UP_OK) return 1;
+    sprintf(fieldError, "%s (column %u).", error.message, error.offset + 1);
+    return 0;
+}
+/* Component offsets: plain integers -2000..2000, else a dialog field
+ * (expressions are limited to the model range -400..400). */
+static int ParseOffset(const char *text, long *value)
+{
+    const char *p = text;
+    long n = 0;
+    int negative = 0, digits = 0;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '-' || *p == '+') { negative = *p == '-'; ++p; }
+    while (*p >= '0' && *p <= '9') {
+        n = n*10 + (*p-'0'); ++p; ++digits;
+        if (n > CAD_PARTS_TRANSLATION) n = CAD_PARTS_TRANSLATION + 1;
+    }
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!digits || *p) return ParseField(text, value);
+    if (n > CAD_PARTS_TRANSLATION) { strcpy(fieldError, "Offsets must be -2000..2000."); return 0; }
+    *value = negative ? -n : n;
+    return 1;
 }
 static int ParseProfile(const char *text, CadSketchPoint *out, int *count)
 {
@@ -187,9 +329,33 @@ static void Error(HWND hwnd, const char *text)
 {
     MessageBox(hwnd, text, "CAD", MB_OK | MB_ICONEXCLAMATION);
 }
+static const char *VcMessage(CadVcStatus status)
+{
+    if (status == CAD_VC_CONFLICT)
+        return "Constraint conflict: a fixed vertex or an inconsistent constraint prevents this. Nothing moved.";
+    if (status == CAD_VC_RANGE)
+        return "Constrained vertices would leave -400..400 (or distance out of range). Nothing moved.";
+    return cad_vc_status_string(status);
+}
+static const char *PartsMessage(CadPartsStatus status)
+{
+    switch (status) {
+    case CAD_PARTS_OK: return "OK";
+    case CAD_PARTS_NOT_FOUND: return "Component not found.";
+    case CAD_PARTS_FULL: return "At most 16 components can be placed.";
+    case CAD_PARTS_CACHE_FULL: return "At most 4 different part files can be placed.";
+    case CAD_PARTS_GROUNDED: return "The component is grounded; unground it first.";
+    case CAD_PARTS_ID_EXHAUSTED: return "Component IDs are exhausted.";
+    case CAD_PARTS_CAPACITY: return "Component records exceed 4096 bytes.";
+    case CAD_PARTS_FORMAT: return "Malformed component record.";
+    default: return "Invalid component path or placement (path 1..127 characters, no spaces; offsets -2000..2000).";
+    }
+}
+/* A constraint failure is reported instead of the generic model status. */
 static void ModelResult(HWND hwnd, CadStatus status)
 {
-    if (status != CAD_OK) Error(hwnd, cad_model_status_string(status));
+    if (status != CAD_OK) Error(hwnd, vcFailure ? VcMessage(vcFailure) : cad_model_status_string(status));
+    vcFailure = CAD_VC_OK;
 }
 static void SyncBrowser(void)
 {
@@ -197,12 +363,14 @@ static void SyncBrowser(void)
     char text[100];
     CadVertex *v;
     CadEdge *e;
+    const CadVConstraint *c;
     if (!browser) return;
     SendMessage(browser, WM_SETREDRAW, FALSE, 0);
     SendMessage(browser, LB_RESETCONTENT, 0, 0);
     for (i=0; i<(int)model.vertex_count; ++i) {
         v = &model.vertices[i];
-        sprintf(text, "V%u  (%ld,%ld,%ld)", v->id, v->x, v->y, v->z);
+        sprintf(text, "V%u  (%ld,%ld,%ld)%s", v->id, v->x, v->y, v->z,
+            selected2 == v->id ? " [2nd]" : "");
         row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
         if (row >= 0) {
             SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(DWORD)v->id);
@@ -214,8 +382,39 @@ static void SyncBrowser(void)
         sprintf(text, "E%u  V%u - V%u", e->id, e->a, e->b);
         row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
         if (row >= 0) {
-            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(0x10000UL | e->id));
+            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_EDGE | e->id));
             if (selectedEdge == e->id) SendMessage(browser, LB_SETCURSEL, row, 0);
+        }
+    }
+    if (constraints.count) {
+        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)"Constraints");
+        if (row >= 0) SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)BROWSER_HEADER);
+    }
+    for (i=0; i<constraints.count; ++i) {
+        c = &constraints.items[i];
+        strcpy(text, "  ");
+        if (cad_vc_describe(c, text + 2, sizeof(text) - 2) != CAD_VC_OK) continue;
+        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
+        if (row >= 0) {
+            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_CONSTRAINT | c->id));
+            if (selectedConstraint == c->id) SendMessage(browser, LB_SETCURSEL, row, 0);
+        }
+    }
+    if (cad_parts_count(&parts)) {
+        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)"Components");
+        if (row >= 0) SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)BROWSER_HEADER);
+    }
+    for (i=0; i<(int)cad_parts_count(&parts); ++i) {
+        CadAssemblyId id;
+        CadPartsInfo info;
+        if (cad_parts_at(&parts, (unsigned)i, &id) != CAD_PARTS_OK ||
+            cad_parts_get(&parts, id, &info) != CAD_PARTS_OK) continue;
+        sprintf(text, "  %s%s%s", info.name, info.missing ? " (missing)" : "",
+            info.grounded ? " (grounded)" : "");
+        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
+        if (row >= 0) {
+            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_COMPONENT | id));
+            if (selectedComponent == id) SendMessage(browser, LB_SETCURSEL, row, 0);
         }
     }
     SendMessage(browser, WM_SETREDRAW, TRUE, 0);
@@ -244,9 +443,18 @@ static void UpdateUI(HWND hwnd)
     char title[180];
     HMENU menu = GetMenu(hwnd);
     CadEdge e;
+    CadVConstraint c;
+    UINT two, component;
+    CadPartsInfo info;
+    c.kind = 0;
+    if (selectedComponent && cad_parts_get(&parts, selectedComponent, &info) != CAD_PARTS_OK)
+        selectedComponent = 0;
     if (selected && VertexIndex(selected) < 0) selected = 0;
     if (selectedEdge && cad_model_get_edge(&model, selectedEdge, &e) != CAD_OK)
         selectedEdge = 0;
+    if (selected2 && (VertexIndex(selected2) < 0 || selected2 == selected)) selected2 = 0;
+    if (selectedConstraint && cad_vc_get(&constraints, selectedConstraint, &c) != CAD_VC_OK)
+        selectedConstraint = 0;
     aircraftPresent = AircraftTopology();
     if (!aircraftPresent) shaded = FALSE;
     sprintf(title, "CAD - %s%s%s", *filePath ? filePath : aircraftPresent ? "Boeing 747-400 demo" : "Untitled", Dirty() ? " *" : "", uiTestMode ? " [test]" : "");
@@ -256,7 +464,22 @@ static void UpdateUI(HWND hwnd)
     EnableMenuItem(menu, ID_EDIT_REDO, MF_BYCOMMAND |
         (model.history_cursor < model.history_count ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, ID_EDIT_DELETE, MF_BYCOMMAND |
-        (selected || selectedEdge ? MF_ENABLED : MF_GRAYED));
+        (selected || selectedEdge || selectedConstraint || selectedComponent ? MF_ENABLED : MF_GRAYED));
+    component = MF_BYCOMMAND | (selectedComponent ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, ID_INSERT_MOVE, component);
+    EnableMenuItem(menu, ID_INSERT_GROUND, component);
+    EnableMenuItem(menu, ID_INSERT_REMOVE, component);
+    EnableMenuItem(menu, ID_INSERT_RELOAD, MF_BYCOMMAND |
+        (cad_parts_count(&parts) ? MF_ENABLED : MF_GRAYED));
+    two = MF_BYCOMMAND | (selected && selected2 ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(menu, ID_CONSTRAIN_COINCIDENT, two);
+    EnableMenuItem(menu, ID_CONSTRAIN_ALIGN_X, two);
+    EnableMenuItem(menu, ID_CONSTRAIN_ALIGN_Y, two);
+    EnableMenuItem(menu, ID_CONSTRAIN_ALIGN_Z, two);
+    EnableMenuItem(menu, ID_CONSTRAIN_DISTANCE, MF_BYCOMMAND |
+        ((selected && selected2) || (selectedConstraint && c.kind == CAD_VC_DISTANCE) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, ID_CONSTRAIN_FIX, MF_BYCOMMAND | (selected ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, ID_CONSTRAIN_DELETE, MF_BYCOMMAND | (selectedConstraint ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, ID_EDIT_PROPERTIES, MF_BYCOMMAND |
         (selected ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(menu, ID_VIEW_DRAWING, MF_BYCOMMAND | (sheetView ? MF_CHECKED : MF_UNCHECKED));
@@ -270,8 +493,16 @@ static void UpdateUI(HWND hwnd)
     CheckMenuItem(menu, ID_TOOLS_MM, MF_BYCOMMAND |
         (model.units == CAD_UNITS_MM ? MF_CHECKED : MF_UNCHECKED));
 }
+/* Geometry may have changed outside the constraint module (undo, redo, load,
+ * delete, create, macro): drop records of vanished vertices, mark unmet ones
+ * Sick and heal met ones. Never moves geometry. */
+static void SyncConstraints(void)
+{
+    cad_vc_sync(&constraints, &model, NULL, NULL);
+}
 static void Changed(HWND hwnd)
 {
+    SyncConstraints();
     UpdateUI(hwnd);
     SyncBrowser();
     InvalidateRect(hwnd, NULL, FALSE);
@@ -291,13 +522,24 @@ static void EndGesture(HWND hwnd, BOOL accept)
     if (old) Changed(hwnd);
     ModelResult(hwnd, status);
 }
+/* Every vertex move (grip, arrows, properties) goes through the constraint
+ * solver and stages the whole solution into the caller's ACTIVE transaction.
+ * On a constraint failure vcFailure explains the error for ModelResult. */
+static CadStatus StageVertexMove(CadId id, long x, long y, long z)
+{
+    CadVcStatus vc = cad_vc_drag(&constraints, &model, id, x, y, z, &vcMoves);
+    if (vc == CAD_VC_OK) vc = cad_vc_stage_moves(&model, &vcMoves);
+    if (vc == CAD_VC_OK) return CAD_OK;
+    vcFailure = vc;
+    return vc == CAD_VC_RANGE ? CAD_RANGE : CAD_INVALID_ARGUMENT;
+}
 static CadStatus MoveSelected(long x, long y, long z)
 {
     CadStatus status;
     if (!selected) return CAD_NOT_FOUND;
     status = cad_model_begin(&model);
     if (status != CAD_OK) return status;
-    status = cad_model_move_vertex(&model, selected, x,y,z);
+    status = StageVertexMove(selected, x,y,z);
     if (status != CAD_OK) { cad_model_cancel(&model); return status; }
     return cad_model_commit(&model);
 }
@@ -310,17 +552,37 @@ static void ToCamera(double x, double y, double z, double *u, double *v)
     z1 = (-x*ISin(yaw) + z*ICos(yaw))/1024.0;
     *v = (y*ICos(pitch) - z1*ISin(pitch))/1024.0;
 }
+/* Grows the fit extent by one world point (the first point resets it). */
+static void FitPoint(double x,double y,double z,double *extent,BOOL *first)
+{
+    double u,v;
+    ToCamera(x,y,z,&u,&v);
+    if (u<0) u=-u;
+    if (v<0) v=-v;
+    u=2*u/(canvasWidth>40 ? canvasWidth-40 : 1);
+    v=2*v/(canvasHeight>40 ? canvasHeight-40 : 1);
+    if (*first || u>*extent) *extent=u;
+    if (v>*extent) *extent=v;
+    *first=FALSE;
+}
+/* Zoom all: model vertices plus the world bounds of placed components. */
 static void Fit(void)
 {
-    int i;
-    double minX,maxX,minY,maxY,minZ,maxZ,u,v,extent;
-    if (!model.vertex_count) {
+    int i,k;
+    long lo[3],hi[3];
+    double minX,maxX,minY,maxY,minZ,maxZ,extent;
+    BOOL components=cad_parts_bounds(&parts,lo,hi),first=TRUE;
+    if (!model.vertex_count && !components) {
         centerX=centerY=centerZ=0;
         scale = canvasWidth>0 && canvasHeight>0 ?
             (double)min(canvasWidth,canvasHeight)/250.0 : 1.0;
     } else {
-        minX=maxX=model.vertices[0].x; minY=maxY=model.vertices[0].y;
-        minZ=maxZ=model.vertices[0].z;
+        if (model.vertex_count) {
+            minX=maxX=model.vertices[0].x; minY=maxY=model.vertices[0].y;
+            minZ=maxZ=model.vertices[0].z;
+        } else {
+            minX=maxX=lo[0]; minY=maxY=lo[1]; minZ=maxZ=lo[2];
+        }
         for (i=1; i<(int)model.vertex_count; ++i) {
             if (model.vertices[i].x<minX) minX=model.vertices[i].x;
             if (model.vertices[i].x>maxX) maxX=model.vertices[i].x;
@@ -329,17 +591,20 @@ static void Fit(void)
             if (model.vertices[i].z<minZ) minZ=model.vertices[i].z;
             if (model.vertices[i].z>maxZ) maxZ=model.vertices[i].z;
         }
+        if (components) {
+            if (lo[0]<minX) minX=lo[0];
+            if (hi[0]>maxX) maxX=hi[0];
+            if (lo[1]<minY) minY=lo[1];
+            if (hi[1]>maxY) maxY=hi[1];
+            if (lo[2]<minZ) minZ=lo[2];
+            if (hi[2]>maxZ) maxZ=hi[2];
+        }
         centerX=(minX+maxX)/2; centerY=(minY+maxY)/2; centerZ=(minZ+maxZ)/2;
         extent=1;
-        for (i=0; i<(int)model.vertex_count; ++i) {
-            ToCamera(model.vertices[i].x,model.vertices[i].y,model.vertices[i].z,&u,&v);
-            if (u<0) u=-u;
-            if (v<0) v=-v;
-            u=2*u/(canvasWidth>40 ? canvasWidth-40 : 1);
-            v=2*v/(canvasHeight>40 ? canvasHeight-40 : 1);
-            if (i==0 || u>extent) extent=u;
-            if (v>extent) extent=v;
-        }
+        for (i=0; i<(int)model.vertex_count; ++i)
+            FitPoint(model.vertices[i].x,model.vertices[i].y,model.vertices[i].z,&extent,&first);
+        if (components) for (k=0; k<8; ++k)
+            FitPoint(k&1 ? hi[0] : lo[0],k&2 ? hi[1] : lo[1],k&4 ? hi[2] : lo[2],&extent,&first);
         scale=extent>0.0001 ? 1.0/extent : 1.0;
     }
     if (scale<0.001) scale=0.001;
@@ -399,6 +664,12 @@ static void WorldLine(HDC dc, double x1,double y1,double z1,double x2,double y2,
     ToCamera(x1,y1,z1,&u1,&v1); ToCamera(x2,y2,z2,&u2,&v2);
     CanvasLine(dc,canvasWidth/2.0+u1*scale,canvasHeight/2.0-v1*scale,
         canvasWidth/2.0+u2*scale,canvasHeight/2.0-v2*scale);
+}
+/* cad_parts_segments sink; component coordinates may reach +-2400, which
+ * WorldLine/CanvasLine clip in floating point. context is an HDC *. */
+static void ComponentSegment(void *context,long x1,long y1,long z1,long x2,long y2,long z2)
+{
+    WorldLine(*(HDC *)context,x1,y1,z1,x2,y2,z2);
 }
 static int Materialize(void)
 {
@@ -535,28 +806,51 @@ static BOOL DrawAircraft(HDC dc)
 }
 
 typedef struct RibbonButton { const char *label; int command, span; } RibbonButton;
-static const RibbonButton modelButtons[] = {
+static const RibbonButton NEAR modelButtons[] = {
     {"Box",ID_CREATE_BOX,46}, {"Extrude",ID_CREATE_EXTRUDE,62},
     {"Properties",ID_EDIT_PROPERTIES,78}, {"Undo",ID_EDIT_UNDO,48},
     {"Redo",ID_EDIT_REDO,48}, {"Wireframe",ID_VIEW_WIREFRAME,76},
     {"Shaded",ID_VIEW_SHADED,60}, {"Fit",ID_VIEW_FIT,38}
 };
-static const RibbonButton sketchButtons[] = {
+static const RibbonButton NEAR sketchButtons[] = {
     {"Line",ID_CREATE_LINE,44}, {"Rectangle",ID_CREATE_RECTANGLE,76},
     {"Snap",ID_TOOLS_SNAP,48}, {"Properties",ID_EDIT_PROPERTIES,78},
     {"Undo",ID_EDIT_UNDO,48}, {"Redo",ID_EDIT_REDO,48}, {"Fit",ID_VIEW_FIT,38}
 };
-static const RibbonButton viewButtons[] = {
+static const RibbonButton NEAR viewButtons[] = {
     {"Front",ID_VIEW_FRONT,48}, {"Top",ID_VIEW_TOP,40},
     {"Side",ID_VIEW_SIDE,42}, {"Isometric",ID_VIEW_ISO,76},
     {"Fit",ID_VIEW_FIT,38}, {"Orbit",ID_VIEW_ORBIT,46},
     {"Wireframe",ID_VIEW_WIREFRAME,76}, {"Shaded",ID_VIEW_SHADED,60}, {"Grid",ID_VIEW_GRID,42}
 };
 
+static const RibbonButton NEAR constrainButtons[] = {
+    {"Coincident",ID_CONSTRAIN_COINCIDENT,72}, {"Align X",ID_CONSTRAIN_ALIGN_X,56},
+    {"Align Y",ID_CONSTRAIN_ALIGN_Y,56}, {"Align Z",ID_CONSTRAIN_ALIGN_Z,56},
+    {"Distance",ID_CONSTRAIN_DISTANCE,64}, {"Fix",ID_CONSTRAIN_FIX,38},
+    {"Delete",ID_CONSTRAIN_DELETE,54}, {"Undo",ID_EDIT_UNDO,48}
+};
+static const RibbonButton NEAR manageButtons[] = {
+    {"Parameters fx",ID_TOOLS_PARAMETERS,96}, {"Run Macro",ID_TOOLS_RUN_MACRO,76},
+    {"Undo",ID_EDIT_UNDO,48}, {"Redo",ID_EDIT_REDO,48}
+};
+static const RibbonButton NEAR assembleButtons[] = {
+    {"Place",ID_INSERT_PLACE,48}, {"Move",ID_INSERT_MOVE,46},
+    {"Ground",ID_INSERT_GROUND,56}, {"Remove",ID_INSERT_REMOVE,58},
+    {"Reload",ID_INSERT_RELOAD,56}, {"Fit",ID_VIEW_FIT,38}
+};
+#define RIBBON_TABS 6
+static const char *const NEAR tabNames[RIBBON_TABS] = {"3D Model", "Sketch", "View", "Constrain", "Manage", "Assemble"};
+static const int NEAR tabLeft[RIBBON_TABS] = {8, 108, 190, 252, 334, 406};
+static const int NEAR tabRight[RIBBON_TABS] = {102, 184, 246, 328, 400, 478};
+
 static const RibbonButton *RibbonItems(int *count)
 {
     if (ribbonTab == 1) { *count = sizeof(sketchButtons)/sizeof(sketchButtons[0]); return sketchButtons; }
     if (ribbonTab == 2) { *count = sizeof(viewButtons)/sizeof(viewButtons[0]); return viewButtons; }
+    if (ribbonTab == 3) { *count = sizeof(constrainButtons)/sizeof(constrainButtons[0]); return constrainButtons; }
+    if (ribbonTab == 4) { *count = sizeof(manageButtons)/sizeof(manageButtons[0]); return manageButtons; }
+    if (ribbonTab == 5) { *count = sizeof(assembleButtons)/sizeof(assembleButtons[0]); return assembleButtons; }
     *count = sizeof(modelButtons)/sizeof(modelButtons[0]); return modelButtons;
 }
 
@@ -566,9 +860,8 @@ static int RibbonHit(int x, int y)
     int i, count, left = 8;
     if (y < 0 || y >= RIBBON_HEIGHT || x < 0 || x >= width) return 0;
     if (y < 23) {
-        if (x >= 8 && x < 102) return 10000;
-        if (x >= 108 && x < 184) return 10001;
-        if (x >= 190 && x < 246) return 10002;
+        for (i = 0; i < RIBBON_TABS; ++i)
+            if (x >= tabLeft[i] && x < tabRight[i]) return 10000 + i;
         return 0;
     }
     items = RibbonItems(&count);
@@ -581,8 +874,6 @@ static int RibbonHit(int x, int y)
 
 static void DrawRibbon(HDC dc)
 {
-    static const char *tabs[] = {"3D Model", "Sketch", "View"};
-    static const int tabLeft[] = {8, 108, 190}, tabRight[] = {102, 184, 246};
     const RibbonButton *items;
     RECT r;
     HBRUSH background, active;
@@ -594,10 +885,10 @@ static void DrawRibbon(HDC dc)
     r.left = r.top = 0; r.right = width; r.bottom = RIBBON_HEIGHT;
     FillRect(dc, &r, background ? background : (HBRUSH)GetStockObject(LTGRAY_BRUSH));
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0,0,0));
-    for (i = 0; i < 3; ++i) {
+    for (i = 0; i < RIBBON_TABS; ++i) {
         r.left = tabLeft[i]; r.right = tabRight[i]; r.top = 2; r.bottom = 23;
         if (ribbonTab == i) FillRect(dc, &r, active ? active : (HBRUSH)GetStockObject(WHITE_BRUSH));
-        DrawText(dc, tabs[i], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawText(dc, tabNames[i], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     items = RibbonItems(&count);
     for (i = 0; i < count; ++i) {
@@ -653,6 +944,33 @@ static void DrawViewCube(HDC dc)
     if (hover) DeleteObject(hover);
 }
 
+/* One letter per constraint end, stacked beside the vertex grip:
+ * C coincident, A align, D distance, F fix; Sick records in red. Requires
+ * Project() for the current view. */
+static void DrawConstraintGlyphs(HDC dc)
+{
+    unsigned char stack[CAD_MAX_VERTICES];
+    int i, end, index;
+    const CadVConstraint *c;
+    char letter[2];
+    if (!constraints.count) return;
+    memset(stack, 0, sizeof(stack));
+    letter[1] = 0;
+    for (i = 0; i < constraints.count; ++i) {
+        c = &constraints.items[i];
+        letter[0] = c->kind == CAD_VC_COINCIDENT ? 'C' : c->kind == CAD_VC_ALIGN ? 'A' :
+            c->kind == CAD_VC_DISTANCE ? 'D' : 'F';
+        SetTextColor(dc, c->health == CAD_VC_SICK ? RGB(220,0,0) : RGB(0,90,200));
+        for (end = 0; end < 2; ++end) {
+            index = VertexIndex(end ? c->b : c->a);
+            if (index < 0 || !visible[index] || stack[index] >= 4) continue;
+            TextOut(dc, px[index] + GRIP + 2 + stack[index] * 7, py[index] - GRIP - 11, letter, 1);
+            ++stack[index];
+        }
+    }
+    SetTextColor(dc, RGB(0,0,0));
+}
+
 static void Render(HDC dc)
 {
     RECT r;
@@ -691,16 +1009,30 @@ static void Render(HDC dc)
             WorldLine(dc,v->x,v->y,v->z,w->x,w->y,w->z);
             SelectObject(dc,edgePen ? (HGDIOBJ)edgePen : GetStockObject(BLACK_PEN));
         }
+        /* Components: dark blue; the selected occurrence again, thick red. */
+        if (cad_parts_count(&parts)) {
+            SelectObject(dc,componentPen ? (HGDIOBJ)componentPen : GetStockObject(BLACK_PEN));
+            cad_parts_segments(&parts,0,ComponentSegment,&dc);
+            if (selectedComponent) {
+                SelectObject(dc,selectedPen ? (HGDIOBJ)selectedPen : GetStockObject(BLACK_PEN));
+                cad_parts_segments(&parts,selectedComponent,ComponentSegment,&dc);
+            }
+            SelectObject(dc,edgePen ? (HGDIOBJ)edgePen : GetStockObject(BLACK_PEN));
+        }
         Project();
         oldBrush=SelectObject(dc,GetStockObject(WHITE_BRUSH));
         for (i=0; i<(int)model.vertex_count; ++i) if (visible[i]) {
-            if (aircraftPresent && model.vertices[i].id != selected) continue;
-            SelectObject(dc,model.vertices[i].id==selected && hotBrush ?
-                (HGDIOBJ)hotBrush : GetStockObject(WHITE_BRUSH));
+            if (aircraftPresent && model.vertices[i].id != selected &&
+                model.vertices[i].id != selected2) continue;
+            SelectObject(dc,model.vertices[i].id==selected && hotBrush ? (HGDIOBJ)hotBrush :
+                model.vertices[i].id==selected2 && secondBrush ? (HGDIOBJ)secondBrush :
+                GetStockObject(WHITE_BRUSH));
             Rectangle(dc,px[i]-GRIP,py[i]-GRIP,px[i]+GRIP+1,py[i]+GRIP+1);
         }
         SelectObject(dc,oldBrush);
-        if (!model.vertex_count) TextOut(dc,12,12,"Empty document - use Create",27);
+        DrawConstraintGlyphs(dc);
+        if (!model.vertex_count && !cad_parts_count(&parts))
+            TextOut(dc,12,12,"Empty document - use Create",27);
         DrawViewCube(dc);
     }
     SelectObject(dc,oldPen);
@@ -715,13 +1047,17 @@ static void Render(HDC dc)
         model.vertex_count,model.edge_count,
         model.units==CAD_UNITS_MM ? "mm" : model.units==CAD_UNITS_INCHES ? "inches" : "unspecified",
         sheetView ? "drawing" : filled ? "shaded" : "wireframe",snap ? " / snap 10" : "",selected,selectedEdge);
+    if (selected2) sprintf(text+strlen(text)," +V%u",selected2);
+    sprintf(text+strlen(text)," | fx %u | constraints %d | parts %u",cad_userparams_count(&userParams),
+        constraints.count,cad_parts_count(&parts));
     TextOut(dc,4,height-STATUS_HEIGHT+5,text,strlen(text));
     /* Debug-only display telemetry follows the real rendered state. It does
      * not drive commands or modify the document. Normal launches omit it. */
     if (uiTestMode && width > 90 && height > 4) {
         telemetry = (DWORD)model.vertex_count | ((DWORD)model.edge_count << 9) |
             ((DWORD)model.units << 19) | ((DWORD)(filled ? 1 : 0) << 21) |
-            ((DWORD)(Dirty() ? 1 : 0) << 22);
+            ((DWORD)(Dirty() ? 1 : 0) << 22) |
+            ((DWORD)(cad_parts_count(&parts) ? 1 : 0) << 23);
         checksum = (telemetry ^ (telemetry >> 8) ^ (telemetry >> 16) ^ 0xa7UL) & 255;
         telemetry |= checksum << 24;
         marker[0] = RGB(255,0,255); marker[1] = RGB(255,255,0);
@@ -756,6 +1092,7 @@ static void MouseMove(HWND hwnd,int x,int y)
 {
     double du,dv,dx,dy,dz;
     CadStatus status;
+    CadVcStatus vc;
     if (!gesture) {
         int hit = !sheetView && BuildViewCube() ? cad_cube_hit(&viewCube,x,y) : CAD_CUBE_NONE;
         if (cubeHover != hit) { cubeHover = hit; InvalidateRect(hwnd,NULL,FALSE); }
@@ -783,27 +1120,39 @@ static void MouseMove(HWND hwnd,int x,int y)
          * Returning to the press pixel restores exact unsnapped coordinates. */
         status=cad_model_cancel(&model);
         if (status==CAD_OK) status=cad_model_begin(&model);
-        if (status==CAD_OK) status=cad_model_move_vertex(&model,dragTarget,
+        /* Constrained partners are re-solved from the press state too. A
+         * group pushed past -400..400 simply stays at the press state; a
+         * fixed vertex/group ends the drag with an explanation. */
+        if (status==CAD_OK) status=StageVertexMove(dragTarget,
             x==startMouseX && y==startMouseY ? dragStart.x : BoundedCoordinate(dragStart.x+dx,dragSnap && dx!=0),
             x==startMouseX && y==startMouseY ? dragStart.y : BoundedCoordinate(dragStart.y+dy,dragSnap && dy!=0),
             x==startMouseX && y==startMouseY ? dragStart.z : BoundedCoordinate(dragStart.z+dz,dragSnap && dz!=0));
-        if (status!=CAD_OK) { EndGesture(hwnd,FALSE); ModelResult(hwnd,status); return; }
+        if (status!=CAD_OK && vcFailure==CAD_VC_RANGE) { vcFailure=CAD_VC_OK; status=CAD_OK; }
+        if (status!=CAD_OK) {
+            vc=vcFailure; EndGesture(hwnd,FALSE); vcFailure=vc; ModelResult(hwnd,status); return;
+        }
     }
     InvalidateRect(hwnd,NULL,FALSE);
 }
 
+/* Initialized statics are NEAR (DGROUP) throughout this module: Watcom
+ * -zt=1 packs far BSS to ~65000 bytes and then appends initialized far data
+ * to that same segment, overflowing it (reported as 0xFFFF bytes; the guest
+ * saw zeroed tables). Keep initialized data out of the far segments. */
+static char NEAR cadFilter[]="CAD documents (*.CAD)\0*.CAD\0All files (*.*)\0*.*\0\0";
+static char NEAR dxfFilter[]="DXF wireframe (*.DXF)\0*.DXF\0\0";
+static char NEAR objFilter[]="OBJ wireframe (*.OBJ)\0*.OBJ\0\0";
+static char NEAR cmdFilter[]="CAD macros (*.CMD)\0*.CMD\0All files (*.*)\0*.*\0\0";
 static BOOL PickPath(HWND hwnd, BOOL save, int format, char *path)
 {
     OPENFILENAME ofn;
     BOOL result;
-    static char cadFilter[]="CAD documents (*.CAD)\0*.CAD\0All files (*.*)\0*.*\0\0";
-    static char dxfFilter[]="DXF wireframe (*.DXF)\0*.DXF\0\0";
-    static char objFilter[]="OBJ wireframe (*.OBJ)\0*.OBJ\0\0";
     memset(&ofn,0,sizeof(ofn));
     ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=hwnd; ofn.hInstance=instance;
-    ofn.lpstrFilter=format<0 ? cadFilter : format==CAD_EXPORT_DXF ? dxfFilter : objFilter;
+    ofn.lpstrFilter=format==PICK_MACRO ? cmdFilter : format<0 ? cadFilter :
+        format==CAD_EXPORT_DXF ? dxfFilter : objFilter;
     ofn.lpstrFile=path; ofn.nMaxFile=PATH_BYTES;
-    ofn.lpstrDefExt=format<0 ? "CAD" : format==CAD_EXPORT_DXF ? "DXF" : "OBJ";
+    ofn.lpstrDefExt=format==PICK_MACRO ? "CMD" : format<0 ? "CAD" : format==CAD_EXPORT_DXF ? "DXF" : "OBJ";
     ofn.Flags=OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
     if (!save) ofn.Flags|=OFN_FILEMUSTEXIST;
     else if (format<0) ofn.Flags|=OFN_OVERWRITEPROMPT;
@@ -811,12 +1160,102 @@ static BOOL PickPath(HWND hwnd, BOOL save, int format, char *path)
     if (!result && CommDlgExtendedError()) Error(hwnd,"File dialog failed (path must fit 127 bytes).");
     return result;
 }
+/* CADG v2 extension text: "[PARAMS]\n" + cad_userparams text, then
+ * "[CONSTRAINTS]\n" + cad_vconstraints text, then (only when components are
+ * placed) "[PARTS]\n" + cad_parts text. Each section is <= 4096 bytes, so
+ * the total stays far below CAD_DOC_EXT_MAX. */
+static unsigned BuildExtension(void)
+{
+    unsigned n;
+    strcpy(extText, "[PARAMS]\n"); n = strlen(extText);
+    n += ParamText(extText + n);
+    strcpy(extText + n, "[CONSTRAINTS]\n"); n += strlen(extText + n);
+    n += VcText(extText + n);
+    if (cad_parts_count(&parts)) {
+        strcpy(extText + n, "[PARTS]\n"); n += strlen(extText + n);
+        n += PartsText(extText + n);
+    }
+    return n;
+}
+/* Parses all sections, then commits parameters and constraint records only
+ * if every section is valid (fail-atomic; message explains a failure).
+ * Policy: text before the first header, duplicate sections and UNKNOWN
+ * sections are rejected, so a document written by a newer CAD.EXE is never
+ * silently re-saved without its data. Missing sections mean empty (v1). */
+/* Commit order: constraints parse into staging; parameters, then components
+ * are read straight into the live tables (both modules are fail-atomic).
+ * Only one live CadParts may exist (its part models are module statics), so
+ * if [PARTS] fails after [PARAMS] succeeded, the previous parameter table is
+ * restored from its own serialized text (exact round trip). A successful
+ * [PARTS] read re-loads every referenced part file from disk. */
+static BOOL ApplyExtension(const char *text, unsigned length, CadUnits units, char *message)
+{
+    const char *body[3], *line, *end = text + length;
+    unsigned bodyLength[3], n;
+    int section = -1, i, seen[3], status;
+    CadUserParamError error;
+    CadUnits oldUnits = cad_userparams_units(&userParams);
+    CadVcStatus vc;
+    body[0] = body[1] = body[2] = "";
+    bodyLength[0] = bodyLength[1] = bodyLength[2] = 0;
+    seen[0] = seen[1] = seen[2] = 0;
+    for (line = text; line < end; line += n) {
+        for (n = 0; line + n < end && line[n] != '\n'; ++n) {}
+        if (line + n < end) ++n;
+        if (*line != '[') {
+            if (section < 0) { strcpy(message, "Document extension text precedes any section."); return FALSE; }
+            bodyLength[section] += n;
+            continue;
+        }
+        if (n == 9 && !strncmp(line, "[PARAMS]\n", 9)) i = 0;
+        else if (n == 14 && !strncmp(line, "[CONSTRAINTS]\n", 14)) i = 1;
+        else if (n == 8 && !strncmp(line, "[PARTS]\n", 8)) i = 2;
+        else {
+            sprintf(message, "Unsupported document section %.40s", line);
+            if (strchr(message, '\n')) *strchr(message, '\n') = 0;
+            return FALSE;
+        }
+        if (seen[i]) { strcpy(message, "Duplicate document section."); return FALSE; }
+        seen[i] = 1; section = i; body[i] = line + n;
+    }
+    vc = cad_vc_read_text(&loadConstraints, body[1], bodyLength[1], &n);
+    if (vc != CAD_VC_OK) {
+        sprintf(message, "[CONSTRAINTS] line %u: %s", n, cad_vc_status_string(vc)); return FALSE;
+    }
+    ParamText(sectionScratch);
+    if (cad_userparams_read_text(&userParams, body[0], bodyLength[0], units, &error) != CAD_UP_OK) {
+        sprintf(message, "[PARAMS] line %u: %s", error.line, error.message); return FALSE;
+    }
+    n = 0;
+    status = cad_parts_read_text(&parts, body[2], bodyLength[2], &n);
+    if (status != CAD_PARTS_OK) {
+        cad_userparams_read_text(&userParams, sectionScratch, strlen(sectionScratch), oldUnits, NULL);
+        sprintf(message, "[PARTS] line %u: %s", n, PartsMessage((CadPartsStatus)status)); return FALSE;
+    }
+    constraints = loadConstraints;
+    return TRUE;
+}
+static void ResetSelection(void)
+{
+    selected = selectedEdge = selected2 = 0;
+    selectedConstraint = 0;
+    selectedComponent = 0;
+    groupKind = 0;
+}
+/* New/demo documents start with no parameters, constraints or components. */
+static void ResetDocumentState(void)
+{
+    cad_userparams_init(&userParams, model.units);
+    cad_vc_init(&constraints);
+    cad_parts_init(&parts);
+    ResetSelection();
+}
 static BOOL SaveDocument(HWND hwnd,BOOL saveAs)
 {
     char path[PATH_BYTES];
     strcpy(path,filePath);
     if ((saveAs || !*path) && !PickPath(hwnd,TRUE,-1,path)) return FALSE;
-    if (cad_document_save(path,&model)!=0) {
+    if (cad_document_save_ex(path,&model,extText,BuildExtension())!=0) {
         Error(hwnd,"Could not save CAD document. Document remains modified."); return FALSE;
     }
     strcpy(filePath,path); MarkSaved(); UpdateUI(hwnd); return TRUE;
@@ -833,7 +1272,7 @@ static BOOL MayDiscard(HWND hwnd)
 
 BOOL FAR PASCAL __export CoordinatesDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
 {
-    char text[32];
+    char text[CAD_USERPARAM_EXPR_MAX+2];
     const char *labels[6];
     int i,n;
     long values[6];
@@ -852,7 +1291,7 @@ BOOL FAR PASCAL __export CoordinatesDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
         for (i=0; i<6; ++i) {
             SetDlgItemText(dlg,IDC_LABEL1+i,labels[i]);
             sprintf(text,"%ld",dialogValues[i]); SetDlgItemText(dlg,IDC_VALUE1+i,text);
-            SendDlgItemMessage(dlg,IDC_VALUE1+i,EM_LIMITTEXT,16,0);
+            SendDlgItemMessage(dlg,IDC_VALUE1+i,EM_LIMITTEXT,CAD_USERPARAM_EXPR_MAX,0);
             if (i>=n) {
                 ShowWindow(GetDlgItem(dlg,IDC_LABEL1+i),SW_HIDE);
                 ShowWindow(GetDlgItem(dlg,IDC_VALUE1+i),SW_HIDE);
@@ -865,9 +1304,11 @@ BOOL FAR PASCAL __export CoordinatesDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
     if (msg==WM_COMMAND && wp==IDOK) {
         for (i=0; i<n; ++i) {
             GetDlgItemText(dlg,IDC_VALUE1+i,text,sizeof(text));
-            if (!ParseCoordinate(text,&values[i]) ||
-                (i>=3 && dialogCommand!=ID_CREATE_LINE && values[i]<=0)) {
-                Error(dlg,"Enter an integer from -400 to 400; dimensions must be 1..400.");
+            if (!ParseField(text,&values[i])) {
+                Error(dlg,fieldError); SetFocus(GetDlgItem(dlg,IDC_VALUE1+i)); return TRUE;
+            }
+            if (i>=3 && dialogCommand!=ID_CREATE_LINE && values[i]<=0) {
+                Error(dlg,"Dimensions must be 1..400.");
                 SetFocus(GetDlgItem(dlg,IDC_VALUE1+i)); return TRUE;
             }
         }
@@ -889,7 +1330,7 @@ BOOL FAR PASCAL __export ExtrusionDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
     (void)lp;
     if (msg==WM_INITDIALOG) {
         SendDlgItemMessage(dlg,IDC_PROFILE,EM_LIMITTEXT,250,0);
-        SendDlgItemMessage(dlg,IDC_HEIGHT,EM_LIMITTEXT,16,0);
+        SendDlgItemMessage(dlg,IDC_HEIGHT,EM_LIMITTEXT,CAD_USERPARAM_EXPR_MAX,0);
         SetDlgItemText(dlg,IDC_PROFILE,"-50,-50;50,-50;50,50;-50,50");
         SetDlgItemText(dlg,IDC_HEIGHT,"100"); return TRUE;
     }
@@ -904,13 +1345,210 @@ BOOL FAR PASCAL __export ExtrusionDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
             Error(dlg,"Polygon must be simple, nonzero-area, with no duplicate points or crossings."); return TRUE;
         }
         GetDlgItemText(dlg,IDC_HEIGHT,text,sizeof(text));
-        if (!ParseCoordinate(text,&value) || value<1) {
-            Error(dlg,"Extrusion height must be an integer 1..400 along +Z."); return TRUE;
-        }
+        if (!ParseField(text,&value)) { Error(dlg,fieldError); return TRUE; }
+        if (value<1) { Error(dlg,"Extrusion height must be 1..400 along +Z."); return TRUE; }
         extrusionHeight=(int)value; EndDialog(dlg,IDOK); return TRUE;
     }
     return FALSE;
 }
+static int RunDialog(HWND hwnd,FARPROC proc,int id)
+{
+    int result;
+    FARPROC thunk=MakeProcInstance(proc,instance);
+    if (!thunk) { Error(hwnd,"Not enough memory for dialog callback."); return -1; }
+    result=DialogBox(instance,MAKEINTRESOURCE(id),hwnd,(DLGPROC)thunk);
+    FreeProcInstance(thunk);
+    if (result==-1) Error(hwnd,"Could not create native dialog.");
+    return result;
+}
+
+/* ---- Components (Insert > Place Component) ---- */
+/* Yaw in degrees, a multiple of 45 (negative or >= 360 wrap) -> index 0..7. */
+static int ParseYaw(const char *text, long *index)
+{
+    long degrees;
+    if (!ParseOffset(text,&degrees) || degrees%45) {
+        strcpy(fieldError,"Yaw must be a multiple of 45 degrees (0, 45, ... 315).");
+        return 0;
+    }
+    *index=((degrees/45)%8+8)%8;
+    return 1;
+}
+BOOL FAR PASCAL __export PlacementDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
+{
+    char text[CAD_USERPARAM_EXPR_MAX+2];
+    long values[4];
+    int i;
+    (void)lp;
+    if (msg==WM_INITDIALOG) {
+        SetDlgItemText(dlg,IDC_PLACE_PATH,placePath ? placePath : "");
+        for (i=0; i<4; ++i) {
+            sprintf(text,"%ld",i<3 ? placeValues[i] : placeValues[3]*45);
+            SetDlgItemText(dlg,IDC_VALUE1+i,text);
+            SendDlgItemMessage(dlg,IDC_VALUE1+i,EM_LIMITTEXT,CAD_USERPARAM_EXPR_MAX,0);
+        }
+        return TRUE;
+    }
+    if (msg==WM_COMMAND && wp==IDCANCEL) { EndDialog(dlg,IDCANCEL); return TRUE; }
+    if (msg==WM_COMMAND && wp==IDOK) {
+        for (i=0; i<4; ++i) {
+            GetDlgItemText(dlg,IDC_VALUE1+i,text,sizeof(text));
+            if (!(i<3 ? ParseOffset(text,&values[i]) : ParseYaw(text,&values[i]))) {
+                Error(dlg,fieldError); SetFocus(GetDlgItem(dlg,IDC_VALUE1+i)); return TRUE;
+            }
+        }
+        memcpy(placeValues,values,sizeof(values)); EndDialog(dlg,IDOK); return TRUE;
+    }
+    return FALSE;
+}
+/* Place, move, ground, remove and reload. None of these are model undo
+ * steps; they change the document (dirty) like constraint edits. */
+static void ComponentCommand(HWND hwnd,int command)
+{
+    char path[PATH_BYTES],text[220];
+    CadPartsInfo info;
+    CadAssemblyId id;
+    CadPartsStatus status=CAD_PARTS_OK;
+    unsigned i,missing=0;
+    BOOL known=selectedComponent && cad_parts_get(&parts,selectedComponent,&info)==CAD_PARTS_OK;
+    if (command!=ID_INSERT_PLACE && command!=ID_INSERT_RELOAD && !known) {
+        Error(hwnd,"Select a component in the model browser first."); return;
+    }
+    if (command==ID_INSERT_PLACE) {
+        path[0]=0;
+        if (!PickPath(hwnd,FALSE,-1,path)) return;
+        placePath=path;
+        for (i=0; i<4; ++i) placeValues[i]=0;
+        if (RunDialog(hwnd,(FARPROC)PlacementDlg,IDD_PLACEMENT)!=IDOK) return;
+        status=cad_parts_place(&parts,path,placeValues[0],placeValues[1],placeValues[2],
+            (int)placeValues[3],&id);
+        if (status==CAD_PARTS_OK) {
+            selected=selectedEdge=selected2=0; selectedConstraint=0; selectedComponent=id;
+            if (cad_parts_get(&parts,id,&info)==CAD_PARTS_OK && info.missing)
+                Error(hwnd,"The part file could not be read as a CAD document; it is placed as missing (no geometry). Use Reload Components after fixing it.");
+            sheetView=FALSE; Fit();
+        }
+    } else if (command==ID_INSERT_MOVE) {
+        placePath=info.path;
+        placeValues[0]=info.tx; placeValues[1]=info.ty; placeValues[2]=info.tz; placeValues[3]=info.yaw;
+        if (info.grounded) status=CAD_PARTS_GROUNDED;
+        else if (RunDialog(hwnd,(FARPROC)PlacementDlg,IDD_PLACEMENT)!=IDOK) return;
+        else status=cad_parts_move(&parts,info.id,placeValues[0],placeValues[1],placeValues[2],
+            (int)placeValues[3]);
+    } else if (command==ID_INSERT_GROUND) {
+        status=cad_parts_ground(&parts,info.id,!info.grounded);
+    } else if (command==ID_INSERT_REMOVE) {
+        status=cad_parts_remove(&parts,info.id);
+        if (status==CAD_PARTS_OK) selectedComponent=0;
+    } else {
+        status=cad_parts_reload(&parts);
+        for (i=0; i<cad_parts_count(&parts); ++i)
+            if (cad_parts_at(&parts,i,&id)==CAD_PARTS_OK && cad_parts_get(&parts,id,&info)==CAD_PARTS_OK &&
+                info.missing) ++missing;
+        if (missing) {
+            sprintf(text,"%u component(s) reference part files that could not be read.",missing);
+            Error(hwnd,text);
+        }
+    }
+    if (status!=CAD_PARTS_OK) Error(hwnd,PartsMessage(status));
+    Changed(hwnd);
+}
+
+/* ---- Parameters (fx) ---- */
+static void ParamError(HWND dlg,const CadUserParamError *error)
+{
+    char text[200];
+    CadUserParamInfo info;
+    if (error->parameter_id && cad_userparams_get(&userParams,error->parameter_id,&info)==CAD_UP_OK)
+        sprintf(text,"%s\n\nParameter involved: %s (column %u).",error->message,info.name,error->offset+1);
+    else sprintf(text,"%s (column %u).",error->message,error->offset+1);
+    Error(dlg,text);
+}
+static void FillParamList(HWND dlg,unsigned selectId)
+{
+    char text[CAD_USERPARAM_NAME_MAX+CAD_USERPARAM_EXPR_MAX+CAD_USERPARAM_DISPLAY_MAX+12];
+    CadUserParamInfo info;
+    unsigned i;
+    int row;
+    SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_RESETCONTENT,0,0);
+    for (i=0; i<cad_userparams_count(&userParams); ++i) {
+        if (cad_userparams_at(&userParams,i,&info)!=CAD_UP_OK) continue;
+        sprintf(text,"%s = %s -> %s",info.name,info.expression,info.display);
+        row=(int)SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_ADDSTRING,0,(LPARAM)(LPSTR)text);
+        if (row<0) continue;
+        SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_SETITEMDATA,row,(LPARAM)(DWORD)info.id);
+        if (info.id==selectId) SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_SETCURSEL,row,0);
+    }
+    SetDlgItemText(dlg,IDC_PARAM_UNITS,cad_userparams_units(&userParams)==CAD_UNITS_MM ?
+        "Units: mm (mm/cm/in literals allowed; Tools > Units)" :
+        "Units: unspecified (plain numbers only; Tools > Units)");
+}
+static unsigned SelectedParam(HWND dlg)
+{
+    int row=(int)SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_GETCURSEL,0,0);
+    if (row<0) return 0;
+    return (unsigned)SendDlgItemMessage(dlg,IDC_PARAM_LIST,LB_GETITEMDATA,row,0);
+}
+BOOL FAR PASCAL __export ParametersDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
+{
+    char name[CAD_USERPARAM_NAME_MAX+2], expression[CAD_USERPARAM_EXPR_MAX+2];
+    CadUserParamError error;
+    CadUserParamInfo info;
+    CadUserParamStatus status;
+    unsigned id;
+    BOOL exprChanged,nameChanged;
+    if (msg==WM_INITDIALOG) {
+        SendDlgItemMessage(dlg,IDC_PARAM_NAME,EM_LIMITTEXT,CAD_USERPARAM_NAME_MAX,0);
+        SendDlgItemMessage(dlg,IDC_PARAM_EXPR,EM_LIMITTEXT,CAD_USERPARAM_EXPR_MAX,0);
+        FillParamList(dlg,0);
+        SetFocus(GetDlgItem(dlg,IDC_PARAM_NAME));
+        return FALSE;
+    }
+    if (msg!=WM_COMMAND) return FALSE;
+    if (wp==IDCANCEL) { EndDialog(dlg,IDCANCEL); return TRUE; }
+    if (wp==IDC_PARAM_LIST) {
+        if (HIWORD(lp)==LBN_SELCHANGE && cad_userparams_get(&userParams,SelectedParam(dlg),&info)==CAD_UP_OK) {
+            SetDlgItemText(dlg,IDC_PARAM_NAME,info.name);
+            SetDlgItemText(dlg,IDC_PARAM_EXPR,info.expression);
+        }
+        return TRUE;
+    }
+    if (wp!=IDOK && wp!=IDC_PARAM_ADD && wp!=IDC_PARAM_MODIFY && wp!=IDC_PARAM_DELETE) return FALSE;
+    GetDlgItemText(dlg,IDC_PARAM_NAME,name,sizeof(name));
+    GetDlgItemText(dlg,IDC_PARAM_EXPR,expression,sizeof(expression));
+    id=0;
+    if (wp==IDOK || wp==IDC_PARAM_ADD) {
+        status=cad_userparams_add(&userParams,name,expression,&id,&error);
+    } else {
+        id=SelectedParam(dlg);
+        if (cad_userparams_get(&userParams,id,&info)!=CAD_UP_OK) {
+            Error(dlg,"Select a parameter in the list first."); return TRUE;
+        }
+        if (wp==IDC_PARAM_DELETE) {
+            status=cad_userparams_remove(&userParams,id,&error); id=0;
+        } else {
+            /* Expression first, then rename; undo the expression if the
+             * rename is rejected so Modify is all-or-nothing. */
+            strcpy(sectionScratch,info.expression);
+            exprChanged=strcmp(expression,info.expression)!=0;
+            nameChanged=strcmp(name,info.name)!=0;
+            status=exprChanged ? cad_userparams_set_expression(&userParams,id,expression,&error) : CAD_UP_OK;
+            if (status==CAD_UP_OK && nameChanged) {
+                status=cad_userparams_rename(&userParams,id,name,&error);
+                if (status!=CAD_UP_OK && exprChanged)
+                    cad_userparams_set_expression(&userParams,id,sectionScratch,NULL);
+            }
+        }
+    }
+    if (status!=CAD_UP_OK) { ParamError(dlg,&error); return TRUE; }
+    FillParamList(dlg,id);
+    if (wp!=IDC_PARAM_MODIFY) {
+        SetDlgItemText(dlg,IDC_PARAM_NAME,""); SetDlgItemText(dlg,IDC_PARAM_EXPR,"");
+    }
+    SetFocus(GetDlgItem(dlg,IDC_PARAM_NAME));
+    return TRUE;
+}
+
 static void CreateOrProperties(HWND hwnd,int command)
 {
     CadVertex v;
@@ -948,9 +1586,110 @@ static void CreateOrProperties(HWND hwnd,int command)
     if (status==CAD_OK && command!=ID_EDIT_PROPERTIES) { sheetView=FALSE; Fit(); }
     Changed(hwnd);
 }
+/* ---- Constraints ---- */
+static long AxisDelta(int axis)
+{
+    CadVertex a,b;
+    if (cad_model_get_vertex(&model,selected,&a)!=CAD_OK ||
+        cad_model_get_vertex(&model,selected2,&b)!=CAD_OK) return 0;
+    return axis==0 ? b.x-a.x : axis==1 ? b.y-a.y : b.z-a.z;
+}
+BOOL FAR PASCAL __export DistanceDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
+{
+    char text[CAD_USERPARAM_EXPR_MAX+2];
+    int i;
+    (void)lp;
+    if (msg==WM_INITDIALOG) {
+        CheckRadioButton(dlg,IDC_AXIS_X,IDC_AXIS_Z,IDC_AXIS_X+distanceAxis);
+        for (i=0; i<3; ++i) EnableWindow(GetDlgItem(dlg,IDC_AXIS_X+i),!distanceEditing);
+        if (distanceEditing) SetDlgItemText(dlg,IDC_DIST_LABEL,"Edit distance value (axis is fixed):");
+        SendDlgItemMessage(dlg,IDC_DIST_VALUE,EM_LIMITTEXT,CAD_USERPARAM_EXPR_MAX,0);
+        sprintf(text,"%ld",distanceValue); SetDlgItemText(dlg,IDC_DIST_VALUE,text);
+        SetFocus(GetDlgItem(dlg,IDC_DIST_VALUE));
+        SendDlgItemMessage(dlg,IDC_DIST_VALUE,EM_SETSEL,0,MAKELPARAM(0,-1));
+        return FALSE;
+    }
+    if (msg!=WM_COMMAND) return FALSE;
+    if (wp>=IDC_AXIS_X && wp<=IDC_AXIS_Z && !distanceEditing) {
+        /* Propose the current separation along the newly chosen axis. */
+        sprintf(text,"%ld",AxisDelta(wp-IDC_AXIS_X)); SetDlgItemText(dlg,IDC_DIST_VALUE,text);
+        return TRUE;
+    }
+    if (wp==IDCANCEL) { EndDialog(dlg,IDCANCEL); return TRUE; }
+    if (wp==IDOK) {
+        GetDlgItemText(dlg,IDC_DIST_VALUE,text,sizeof(text));
+        if (!ParseField(text,&distanceValue)) {
+            Error(dlg,fieldError); SetFocus(GetDlgItem(dlg,IDC_DIST_VALUE)); return TRUE;
+        }
+        for (i=0; i<3; ++i) if (IsDlgButtonChecked(dlg,IDC_AXIS_X+i)) distanceAxis=i;
+        EndDialog(dlg,IDOK); return TRUE;
+    }
+    return FALSE;
+}
+/* Stages a solver move list as ONE undoable model command. */
+static CadStatus CommitMoves(void)
+{
+    CadStatus status;
+    CadVcStatus vc;
+    if (!vcMoves.count) return CAD_OK;
+    status=cad_model_begin(&model);
+    if (status!=CAD_OK) return status;
+    vc=cad_vc_stage_moves(&model,&vcMoves);
+    if (vc!=CAD_VC_OK) { cad_model_cancel(&model); vcFailure=vc; return CAD_INVALID_ARGUMENT; }
+    status=cad_model_commit(&model);
+    if (status!=CAD_OK) cad_model_cancel(&model);
+    return status;
+}
+/* Record + geometry change together, or neither. */
+static void FinishConstraintEdit(HWND hwnd,CadVcStatus vc,CadVcId id)
+{
+    CadStatus status;
+    if (vc!=CAD_VC_OK) { Error(hwnd,VcMessage(vc)); return; }
+    status=CommitMoves();
+    if (status!=CAD_OK) { constraints=loadConstraints; ModelResult(hwnd,status); }
+    else if (id) { selectedConstraint=id; }
+    Changed(hwnd);
+}
+static void AddConstraint(HWND hwnd,int kind,int axis,long offset)
+{
+    CadVcId id=0;
+    CadVcStatus vc;
+    if (!selected || (kind!=CAD_VC_FIX && !selected2)) {
+        Error(hwnd,kind==CAD_VC_FIX ? "Select a vertex first." :
+            "Select two vertices: click the first, then Ctrl+click (or Shift+click) the second.");
+        return;
+    }
+    loadConstraints=constraints;
+    vc=cad_vc_add(&constraints,&model,kind,selected,kind==CAD_VC_FIX ? 0 : selected2,
+        axis,offset,&vcMoves,&id);
+    FinishConstraintEdit(hwnd,vc,id);
+}
+static void DistanceCommand(HWND hwnd)
+{
+    CadVConstraint c;
+    distanceEditing=selectedConstraint && cad_vc_get(&constraints,selectedConstraint,&c)==CAD_VC_OK &&
+        c.kind==CAD_VC_DISTANCE && !(selected && selected2);
+    if (!distanceEditing && !(selected && selected2)) {
+        AddConstraint(hwnd,CAD_VC_DISTANCE,0,0); return; /* explains the selection */
+    }
+    if (distanceEditing) { distanceAxis=c.axis; distanceValue=c.offset; }
+    else { distanceAxis=0; distanceValue=AxisDelta(0); }
+    if (RunDialog(hwnd,(FARPROC)DistanceDlg,IDD_DISTANCE)!=IDOK) return;
+    if (!distanceEditing) { AddConstraint(hwnd,CAD_VC_DISTANCE,distanceAxis,distanceValue); return; }
+    loadConstraints=constraints;
+    FinishConstraintEdit(hwnd,cad_vc_set_distance(&constraints,&model,c.id,distanceValue,&vcMoves),c.id);
+}
 static void DeleteSelected(HWND hwnd)
 {
     CadStatus status;
+    if (!selected && !selectedEdge && !selectedConstraint && selectedComponent) {
+        if (cad_parts_remove(&parts,selectedComponent)==CAD_PARTS_OK) selectedComponent=0;
+        Changed(hwnd); return;
+    }
+    if (!selected && !selectedEdge && selectedConstraint) {
+        cad_vc_remove(&constraints,selectedConstraint); selectedConstraint=0;
+        Changed(hwnd); return;
+    }
     if (!selected && !selectedEdge) return;
     status=cad_model_begin(&model);
     if (status!=CAD_OK) { ModelResult(hwnd,status); return; }
@@ -959,24 +1698,123 @@ static void DeleteSelected(HWND hwnd)
     else cad_model_cancel(&model);
     ModelResult(hwnd,status); Changed(hwnd);
 }
+/* ---- Undo groups and macros ---- */
+static unsigned long HistorySignature(void)
+{
+    unsigned long sum=0x5a17UL;
+    unsigned i;
+    int j;
+    sum=sum*31+model.history_count; sum=sum*31+model.history_cursor;
+    sum=sum*31+model.history_used;
+    for (i=0; i<model.history_count; ++i) sum=sum*31+model.lengths[i];
+    for (i=0; i<model.history_used; ++i) {
+        sum=sum*31+model.history[i].kind; sum=sum*31+model.history[i].id;
+        for (j=0; j<6; ++j) sum=sum*31+(unsigned short)model.history[i].data[j];
+    }
+    return sum;
+}
+/* Parameters follow document units; refuse (FALSE) if they cannot. */
+static BOOL FollowUnits(HWND hwnd)
+{
+    CadUserParamError error;
+    char text[200];
+    if (model.units==cad_userparams_units(&userParams)) return TRUE;
+    if (cad_userparams_set_units(&userParams,model.units,&error)==CAD_UP_OK) return TRUE;
+    sprintf(text,"Parameters cannot use the new document units: %s\nEdit them in Tools > Parameters first.",
+        error.message);
+    Error(hwnd,text);
+    return FALSE;
+}
+/* One Undo after a macro undoes all of its history_added commands; Redo
+ * after that redoes them all. Otherwise one command per step. */
+static void UndoRedo(HWND hwnd,BOOL undo)
+{
+    unsigned steps=1,done=0;
+    CadStatus status=CAD_OK;
+    if (groupKind==(undo ? 1 : 2) && groupSignature==HistorySignature()) steps=groupCount;
+    while (done<steps && status==CAD_OK) {
+        status=undo ? cad_model_undo(&model) : cad_model_redo(&model);
+        if (status==CAD_OK) ++done;
+    }
+    if (!FollowUnits(hwnd)) {
+        for (; done; --done) {
+            if (undo) cad_model_redo(&model);
+            else cad_model_undo(&model);
+        }
+        groupKind=0; return;
+    }
+    if (steps>1 && done==steps) { groupKind=undo ? 2 : 1; groupSignature=HistorySignature(); }
+    else groupKind=0;
+    if (!done) ModelResult(hwnd,status);
+}
+/* Macro names resolve to script SET variables first, then to user
+ * parameters: value ticks (1/100 unit) rounded half away from zero. */
+static int ParamLookup(void *context,const char *name,long *value)
+{
+    CadUserParamInfo info;
+    (void)context;
+    if (cad_userparams_get(&userParams,cad_userparams_find(&userParams,name),&info)!=CAD_UP_OK) return 0;
+    *value=info.ticks>=0 ? (info.ticks+50)/100 : -((50-info.ticks)/100);
+    return 1;
+}
+static void RunMacro(HWND hwnd)
+{
+    char path[PATH_BYTES],text[240];
+    FILE *file;
+    CadScriptResult result;
+    path[0]=0;
+    if (!PickPath(hwnd,FALSE,PICK_MACRO,path)) return;
+    file=fopen(path,"rb");
+    if (!file) { Error(hwnd,"Could not open the macro file."); return; }
+    spare=model;
+    cad_script_run_file(file,&model,&stage,ParamLookup,NULL,&result);
+    fclose(file);
+    if (result.status!=CAD_SCRIPT_OK) {
+        if (result.line) sprintf(text,"Macro failed at line %lu: %s\n(%s",result.line,result.message,
+            cad_script_status_string(result.status));
+        else sprintf(text,"Macro failed: %s\n(%s",result.message,cad_script_status_string(result.status));
+        if (result.status==CAD_SCRIPT_MODEL)
+            sprintf(text+strlen(text),": %s",cad_model_status_string(result.model_status));
+        strcat(text,")\n\nThe document is unchanged.");
+        Error(hwnd,text); return;
+    }
+    if (!FollowUnits(hwnd)) { model=spare; Changed(hwnd); return; }
+    groupKind=0;
+    if (result.history_added>1 && !result.history_truncated) {
+        groupKind=1; groupCount=result.history_added; groupSignature=HistorySignature();
+    }
+    sheetView=FALSE; Fit(); Changed(hwnd);
+    if (result.history_truncated)
+        MessageBox(hwnd,"The macro ran, but it produced more than the 32-command undo history.\nUndo can only partially revert it.",
+            "CAD",MB_OK | MB_ICONINFORMATION);
+}
+
 static void Command(HWND hwnd,int command)
 {
-    char path[PATH_BYTES];
+    char path[PATH_BYTES],message[200];
     CadStatus status;
+    CadUserParamError paramError;
+    unsigned extLength;
     int format,result;
     EndGesture(hwnd,FALSE);
     switch (command) {
     case ID_FILE_NEW:
         if (!MayDiscard(hwnd)) return;
-        cad_model_init(&model); selected=selectedEdge=0; filePath[0]=0;
+        cad_model_init(&model); ResetDocumentState(); filePath[0]=0;
         MarkSaved(); sheetView=FALSE; Fit(); break;
     case ID_FILE_OPEN:
         path[0]=0;
         if (!MayDiscard(hwnd) || !PickPath(hwnd,FALSE,-1,path)) return;
-        if (cad_document_load(path,&model,&stage)!=0) {
+        /* Atomic: geometry loads into spare; sections parse into staging;
+         * the live document changes only when everything is valid. */
+        if (cad_document_load_ex(path,&spare,&stage,extText,EXT_BYTES,&extLength)!=0) {
             Error(hwnd,"Could not read CAD document. Current document is retained."); return;
         }
-        strcpy(filePath,path); selected=selectedEdge=0; MarkSaved(); sheetView=FALSE; Fit(); break;
+        if (!ApplyExtension(extText,extLength,spare.units,message)) {
+            strcat(message,"\n\nCurrent document is retained."); Error(hwnd,message); return;
+        }
+        model=spare; ResetSelection();
+        strcpy(filePath,path); SyncConstraints(); MarkSaved(); sheetView=FALSE; Fit(); break;
     case ID_FILE_SAVE: SaveDocument(hwnd,FALSE); break;
     case ID_FILE_SAVEAS: SaveDocument(hwnd,TRUE); break;
     case ID_FILE_EXIT: SendMessage(hwnd,WM_CLOSE,0,0); return;
@@ -994,18 +1832,33 @@ static void Command(HWND hwnd,int command)
         if (!MayDiscard(hwnd)) return;
         status=cad_create_house_demo(&model); ModelResult(hwnd,status);
         if (status!=CAD_OK) return;
-        filePath[0]=0; selected=selectedEdge=0; sheetView=FALSE;
+        ResetDocumentState(); filePath[0]=0; sheetView=FALSE;
         /* Retain saved snapshot: an imported demo must prompt to save. */
         Fit(); break;
     case ID_DEMO_747:
         if (!MayDiscard(hwnd)) return;
         status = cad_aircraft_load(&model); ModelResult(hwnd, status);
         if (status != CAD_OK) return;
-        filePath[0] = 0; selected = selectedEdge = 0; sheetView = FALSE;
+        ResetDocumentState(); filePath[0] = 0; sheetView = FALSE;
         shaded = TRUE; showGrid = FALSE; yaw = 32; pitch = 24;
         Fit(); break;
-    case ID_EDIT_UNDO: ModelResult(hwnd,cad_model_undo(&model)); break;
-    case ID_EDIT_REDO: ModelResult(hwnd,cad_model_redo(&model)); break;
+    case ID_EDIT_UNDO: UndoRedo(hwnd,TRUE); break;
+    case ID_EDIT_REDO: UndoRedo(hwnd,FALSE); break;
+    case ID_CONSTRAIN_COINCIDENT: AddConstraint(hwnd,CAD_VC_COINCIDENT,0,0); return;
+    case ID_CONSTRAIN_ALIGN_X: case ID_CONSTRAIN_ALIGN_Y: case ID_CONSTRAIN_ALIGN_Z:
+        AddConstraint(hwnd,CAD_VC_ALIGN,command-ID_CONSTRAIN_ALIGN_X,0); return;
+    case ID_CONSTRAIN_DISTANCE: DistanceCommand(hwnd); return;
+    case ID_CONSTRAIN_FIX: AddConstraint(hwnd,CAD_VC_FIX,0,0); return;
+    case ID_CONSTRAIN_DELETE:
+        if (selectedConstraint) { selected=selectedEdge=0; DeleteSelected(hwnd); }
+        else Error(hwnd,"Select a constraint in the model browser first.");
+        return;
+    case ID_TOOLS_PARAMETERS:
+        RunDialog(hwnd,(FARPROC)ParametersDlg,IDD_PARAMETERS); break;
+    case ID_TOOLS_RUN_MACRO: RunMacro(hwnd); return;
+    case ID_INSERT_PLACE: case ID_INSERT_MOVE: case ID_INSERT_GROUND:
+    case ID_INSERT_REMOVE: case ID_INSERT_RELOAD:
+        ComponentCommand(hwnd,command); return;
     case ID_EDIT_DELETE: DeleteSelected(hwnd); return;
     case ID_EDIT_PROPERTIES:
     case ID_CREATE_LINE: case ID_CREATE_RECTANGLE: case ID_CREATE_BOX: case ID_CREATE_EXTRUDE:
@@ -1023,16 +1876,26 @@ static void Command(HWND hwnd,int command)
     case ID_TOOLS_SNAP: snap=!snap; break;
     case ID_TOOLS_TEST_STATUS: uiTestMode = TRUE; break;
     case ID_TOOLS_MM: case ID_TOOLS_UNSPECIFIED:
+        /* Parameter units switch first (fail-atomic) so a table that uses
+         * mm/cm/in literals blocks a switch to unspecified units. */
+        if (cad_userparams_set_units(&userParams,command==ID_TOOLS_MM ? CAD_UNITS_MM :
+                CAD_UNITS_UNSPECIFIED,&paramError)!=CAD_UP_OK) {
+            sprintf(message,"Parameters cannot switch units: %s\nEdit them in Tools > Parameters first.",
+                paramError.message);
+            Error(hwnd,message); break;
+        }
         status=cad_model_begin(&model);
         if (status==CAD_OK) {
             status=cad_model_set_units(&model,command==ID_TOOLS_MM ? CAD_UNITS_MM : CAD_UNITS_UNSPECIFIED);
             if (status==CAD_OK) status=cad_model_commit(&model);
             else cad_model_cancel(&model);
         }
+        if (status!=CAD_OK) cad_userparams_set_units(&userParams,model.units,NULL);
         ModelResult(hwnd,status); break;
     case ID_HELP_ABOUT:
-        MessageBox(hwnd,"Wireframe CAD: lines, XY rectangles, boxes, polygon extrusions.\n\nSelect in browser; drag vertex grips. Right-drag orbits.\nArrows: selected X/Z; PgUp/PgDn: Y; Tab: next vertex.\nEnter: coordinates; Esc: cancel drag.\n\n256 vertices / 512 edges; coordinates +/-400.\nUndo: 32 commands / 1024 deltas; operation: 64 deltas.\nExtrude: 3..12 XY points, +Z height 1..400.\nUnits label without rescaling. DXF/OBJ: wireframe only.\nNo curved kernel, solid booleans or feature tree.",
-            "About CAD",MB_OK); return;
+        about[0]=0;
+        for (result=0; aboutText[result]; ++result) strcat(about,aboutText[result]);
+        MessageBox(hwnd,about,"About CAD",MB_OK); return;
     default: return;
     }
     Changed(hwnd);
@@ -1045,7 +1908,7 @@ static BOOL Key(HWND hwnd,WPARAM key)
     int i;
     if (key==VK_ESCAPE) {
         if (gesture) EndGesture(hwnd,FALSE);
-        else { selected=selectedEdge=0; Changed(hwnd); }
+        else { selected=selectedEdge=selected2=0; selectedConstraint=0; selectedComponent=0; Changed(hwnd); }
         return TRUE;
     }
     if (gesture) return TRUE;
@@ -1054,7 +1917,8 @@ static BOOL Key(HWND hwnd,WPARAM key)
         i=VertexIndex(selected);
         if (GetKeyState(VK_SHIFT)<0) i=i<=0 ? model.vertex_count-1 : i-1;
         else i=(i+1)%model.vertex_count;
-        selected=model.vertices[i].id; selectedEdge=0; Changed(hwnd); return TRUE;
+        selected=model.vertices[i].id; selectedEdge=0; selectedConstraint=0; selectedComponent=0;
+        Changed(hwnd); return TRUE;
     }
     if (key!=VK_LEFT && key!=VK_RIGHT && key!=VK_UP && key!=VK_DOWN &&
         key!=VK_PRIOR && key!=VK_NEXT) return FALSE;
@@ -1096,7 +1960,9 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         edgePen=CreatePen(PS_SOLID,1,RGB(0,0,0));
         gridPen=CreatePen(PS_SOLID,1,RGB(215,215,215));
         selectedPen=CreatePen(PS_SOLID,2,RGB(192,0,0));
+        componentPen=CreatePen(PS_SOLID,1,RGB(0,0,160));
         hotBrush=CreateSolidBrush(RGB(255,64,64));
+        secondBrush=CreateSolidBrush(RGB(255,170,0));
         captureTimer=SetTimer(hwnd,TIMER_CAPTURE,80,NULL)!=0;
         Changed(hwnd); return 0;
     case WM_SIZE:
@@ -1130,7 +1996,13 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 return 0;
             }
         }
-        SetFocus(hwnd); index=HitTest(x,y); selectedEdge=0;
+        SetFocus(hwnd); index=HitTest(x,y); selectedEdge=0; selectedConstraint=0; selectedComponent=0;
+        /* Ctrl/Shift+click adds a second vertex for two-vertex constraints. */
+        if ((wp & (MK_CONTROL | MK_SHIFT)) && index>=0 && selected &&
+            model.vertices[index].id!=selected) {
+            selected2=model.vertices[index].id; Changed(hwnd); return 0;
+        }
+        selected2=0;
         selected=index<0 ? 0 : model.vertices[index].id;
         Changed(hwnd);
         if (index<0 || !captureTimer || focal<1) return 0;
@@ -1179,8 +2051,31 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 row=(int)SendMessage(browser,LB_GETCURSEL,0,0);
                 if (row<0) return 0;
                 data=(DWORD)SendMessage(browser,LB_GETITEMDATA,row,0);
-                selected=(data&0x10000UL) ? 0 : (CadId)data;
-                selectedEdge=(data&0x10000UL) ? (CadId)data : 0;
+                if (data==BROWSER_HEADER) return 0;
+                if (data&BROWSER_COMPONENT) {
+                    selected=selectedEdge=selected2=0; selectedConstraint=0;
+                    selectedComponent=(CadAssemblyId)(data&~BROWSER_COMPONENT);
+                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                    if (HIWORD(lp)==LBN_DBLCLK) Command(hwnd,ID_INSERT_MOVE);
+                    return 0;
+                }
+                selectedComponent=0;
+                if (data&BROWSER_CONSTRAINT) {
+                    selected=selectedEdge=selected2=0;
+                    selectedConstraint=(CadVcId)(data&~BROWSER_CONSTRAINT);
+                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                    if (HIWORD(lp)==LBN_DBLCLK) Command(hwnd,ID_CONSTRAIN_DISTANCE);
+                    return 0;
+                }
+                selectedConstraint=0;
+                if (!(data&BROWSER_EDGE) && selected && (CadId)data!=selected &&
+                    (GetKeyState(VK_CONTROL)<0 || GetKeyState(VK_SHIFT)<0)) {
+                    selected2=(CadId)data; SyncBrowser();
+                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE); return 0;
+                }
+                selected2=0;
+                selected=(data&BROWSER_EDGE) ? 0 : (CadId)data;
+                selectedEdge=(data&BROWSER_EDGE) ? (CadId)data : 0;
                 UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
                 if (HIWORD(lp)==LBN_DBLCLK && selected) Command(hwnd,ID_EDIT_PROPERTIES);
             }
@@ -1199,7 +2094,9 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         if (edgePen) DeleteObject(edgePen);
         if (gridPen) DeleteObject(gridPen);
         if (selectedPen) DeleteObject(selectedPen);
+        if (componentPen) DeleteObject(componentPen);
         if (hotBrush) DeleteObject(hotBrush);
+        if (secondBrush) DeleteObject(secondBrush);
         for (index = 0; index < CAD_AIRCRAFT_MATERIAL_COUNT * 8; ++index)
             if (aircraftBrushes[index]) { DeleteObject(aircraftBrushes[index]); aircraftBrushes[index] = NULL; }
         PostQuitMessage(0); return 0;
@@ -1215,7 +2112,8 @@ int PASCAL WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR commandLine,int show)
     int result;
     uiTestMode = strstr(commandLine, "/UITEST") != NULL;
     instance=hInst;
-    cad_model_init(&model); cad_model_init(&stage); MarkSaved();
+    cad_model_init(&model); cad_model_init(&stage); cad_model_init(&spare);
+    ResetDocumentState(); MarkSaved();
     if (!hPrev) {
         memset(&wc,0,sizeof(wc));
         wc.style=CS_HREDRAW | CS_VREDRAW; wc.lpfnWndProc=MainWndProc;
