@@ -1,0 +1,17 @@
+system windows
+name out/cad.exe
+file out/cad.obj
+file out/cad_model.obj
+file out/cad_create.obj
+file out/cad_document.obj
+file out/cad_sketch.obj
+file out/cad_export.obj
+file out/cad_drawing.obj
+file out/cad_aircraft.obj
+file out/cad_meshview.obj
+file out/cad_viewcube.obj
+library commdlg
+option resource=out/cad.res
+option description 'Win31 CAD - Generic document editor'
+option stack=12k
+option heapsize=4k

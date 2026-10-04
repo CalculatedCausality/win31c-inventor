@@ -1,0 +1,7 @@
+system windows
+name out/wallgen.exe
+file out/wallgen.obj
+option quiet
+option description 'Kaleidoscope Wallpaper'
+option stack=8k
+option heapsize=1k

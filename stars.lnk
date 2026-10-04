@@ -1,0 +1,8 @@
+system windows
+name out/stars.scr
+file out/stars.obj
+option quiet
+# Control Panel only lists .SCR files whose description starts like this.
+option description 'SCRNSAVE : Starfield'
+option stack=8k
+option heapsize=1k

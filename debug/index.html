@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>win31c PCjs Debug</title><link rel="stylesheet" href="/machines/pcx86/xsl/components.css"><link rel="stylesheet" href="/debug.css">
+<script defer src="/assets/js/xslt-polyfill.min.js"></script>
+<script defer src="/machines/pcx86/releases/2.25/pcx86.js"></script>
+<script defer src="/debug.js"></script></head>
+<body><header><strong>win31c · PCjs Debug</strong>
+<nav aria-label="Emulator controls">
+<button data-action="run">Run</button><button data-action="pause">Pause</button><button data-action="reset">Reset</button>
+<button data-action="mountLatest">Mount latest A:</button><button data-action="launchCAD">Launch CAD</button>
+<button data-action="focus">Focus display</button><button data-action="speed">CPU speed</button><button data-action="screenshot">Screenshot PNG</button>
+<button data-action="captureMouse">Capture mouse</button><button data-action="releaseMouse">Release mouse</button>
+</nav><output id="status">Loading emulator…</output><pre id="error" role="alert" hidden></pre></header>
+<main><div id="cad" class="machine-placeholder"><p class="machine-warning">Loading isolated PCjs machine…</p></div></main>
+<details><summary>Help / keyboard input</summary>
+<p>Wait for Windows Program Manager to finish booting. Mount latest reads <code>out/disk.img</code> into drive A: using PCjs's original file upload form. Close CAD before remounting after a build. In Program Manager, Launch CAD sends Alt+F, R, then <code>A:\CAD.EXE</code> and Enter with slow emulated keystrokes. Select Program Manager first; this action cannot detect the active guest window. CAD starts with an empty document; the house belongs under Demos, not startup.</p>
+<p>Click the display or Capture mouse to lock the physical mouse to the guest cursor. PCjs uses a relative serial mouse, so capture prevents host/guest pointer offset. Press Escape to release it; click Capture mouse again to resume. Keyboard-only Focus display does not click or capture. CPU speed cycles PCjs's native speed setting. Reset restarts the guest. Reload starts a fresh machine; guest disk writes stay in emulator memory, never in the repository. First boot downloads PCjs/ROM/Windows resources to ignored <code>debug/.cache/</code>; network access is needed until cached.</p>
+<textarea id="text" rows="3" placeholder="Text to type in the guest" aria-label="Guest text"></textarea><button data-action="typeText">Type text</button>
+<p>Console API: <code>window.cadDebug.status(), run(), pause(), reset(), mountLatest(), type(text), keys(PCjsTokens), launchHouse(), focus(), speed(), screenshot()</code>. Async methods return promises. HTTP: <code>/api/health</code>, <code>/api/status</code>, <code>/api/disk</code> (read-only). PCjs by Jeff Parsons: <a href="https://www.pcjs.org/" target="_blank" rel="noopener">upstream / licensing</a>.</p>
+</details></body></html>

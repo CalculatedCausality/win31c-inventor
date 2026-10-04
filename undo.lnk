@@ -1,0 +1,7 @@
+system windows
+name out/undo.exe
+file out/undo.obj
+option quiet
+option description 'Undo Kaleidoscope Wallpaper'
+option stack=8k
+option heapsize=1k

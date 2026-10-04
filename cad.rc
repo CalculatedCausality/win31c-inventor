@@ -1,0 +1,114 @@
+#include <windows.h>
+#include "cad_ui_ids.h"
+
+IDR_CAD_MENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&New\tCtrl+N", ID_FILE_NEW
+        MENUITEM "&Open...\tCtrl+O", ID_FILE_OPEN
+        MENUITEM "&Save\tCtrl+S", ID_FILE_SAVE
+        MENUITEM "Save &As...", ID_FILE_SAVEAS
+        MENUITEM SEPARATOR
+        MENUITEM "Export &DXF wireframe...", ID_FILE_DXF
+        MENUITEM "Export &OBJ wireframe...", ID_FILE_OBJ
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit", ID_FILE_EXIT
+    END
+    POPUP "&Edit"
+    BEGIN
+        MENUITEM "&Undo\tCtrl+Z", ID_EDIT_UNDO
+        MENUITEM "&Redo\tCtrl+Y", ID_EDIT_REDO
+        MENUITEM "&Delete\tDel", ID_EDIT_DELETE
+        MENUITEM "&Properties...\tEnter", ID_EDIT_PROPERTIES
+    END
+    POPUP "&Create"
+    BEGIN
+        MENUITEM "&Line...", ID_CREATE_LINE
+        MENUITEM "&Rectangle (XY)...", ID_CREATE_RECTANGLE
+        MENUITEM "&Box...", ID_CREATE_BOX
+        MENUITEM "&Extrude sketch...", ID_CREATE_EXTRUDE
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "&Orbit (right-drag)", ID_VIEW_ORBIT
+        MENUITEM "&Front", ID_VIEW_FRONT
+        MENUITEM "&Top", ID_VIEW_TOP
+        MENUITEM "&Side", ID_VIEW_SIDE
+        MENUITEM "&Isometric", ID_VIEW_ISO
+        MENUITEM "&Drawing sheet", ID_VIEW_DRAWING
+        MENUITEM "&Grid", ID_VIEW_GRID
+        MENUITEM "&Zoom all (fit)", ID_VIEW_FIT
+        MENUITEM SEPARATOR
+        MENUITEM "&Wireframe", ID_VIEW_WIREFRAME
+        MENUITEM "S&haded aircraft", ID_VIEW_SHADED
+    END
+    POPUP "&Tools"
+    BEGIN
+        POPUP "&Units (no rescaling)"
+        BEGIN
+            MENUITEM "&Unspecified", ID_TOOLS_UNSPECIFIED
+            MENUITEM "&Millimetres", ID_TOOLS_MM
+        END
+        MENUITEM "&Snap to 10\tF9", ID_TOOLS_SNAP
+        MENUITEM "&Debug test status", ID_TOOLS_TEST_STATUS
+    END
+    POPUP "&Demos"
+    BEGIN
+        MENUITEM "&House (replace document)...", ID_DEMO_HOUSE
+        MENUITEM "&Boeing 747-400 (replace document)...", ID_DEMO_747
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About / controls...", ID_HELP_ABOUT
+    END
+END
+
+IDR_CAD_KEYS ACCELERATORS
+BEGIN
+    "N", ID_FILE_NEW, VIRTKEY, CONTROL
+    "O", ID_FILE_OPEN, VIRTKEY, CONTROL
+    "S", ID_FILE_SAVE, VIRTKEY, CONTROL
+    "Z", ID_EDIT_UNDO, VIRTKEY, CONTROL
+    "Y", ID_EDIT_REDO, VIRTKEY, CONTROL
+    VK_DELETE, ID_EDIT_DELETE, VIRTKEY
+    VK_RETURN, ID_EDIT_PROPERTIES, VIRTKEY
+    VK_F9, ID_TOOLS_SNAP, VIRTKEY
+END
+
+IDD_COORDINATES DIALOG 0, 0, 222, 160
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Coordinates"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "Integer coordinates -400..400; sizes must be positive.", -1, 8, 7, 206, 18
+    LTEXT "X", IDC_LABEL1, 8, 30, 90, 10
+    EDITTEXT IDC_VALUE1, 108, 28, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Y", IDC_LABEL2, 8, 47, 90, 10
+    EDITTEXT IDC_VALUE2, 108, 45, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Z", IDC_LABEL3, 8, 64, 90, 10
+    EDITTEXT IDC_VALUE3, 108, 62, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Width", IDC_LABEL4, 8, 81, 90, 10
+    EDITTEXT IDC_VALUE4, 108, 79, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Height", IDC_LABEL5, 8, 98, 90, 10
+    EDITTEXT IDC_VALUE5, 108, 96, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "Depth", IDC_LABEL6, 8, 115, 90, 10
+    EDITTEXT IDC_VALUE6, 108, 113, 100, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "OK", IDOK, 106, 139, 50, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 162, 139, 50, 14
+END
+
+IDD_EXTRUSION DIALOG 0, 0, 272, 132
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Extrude polygon sketch"
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT "XY polygon: 3..12 points, x,y;x,y;... (-400..400).", -1, 8, 8, 256, 12
+    LTEXT "Closing edge is implicit. No repeated first point or crossings.", -1, 8, 22, 256, 12
+    LTEXT "&Profile", -1, 8, 40, 48, 10
+    EDITTEXT IDC_PROFILE, 8, 54, 256, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "&Height (+Z, 1..400)", -1, 8, 78, 110, 12
+    EDITTEXT IDC_HEIGHT, 126, 76, 62, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "OK", IDOK, 156, 108, 50, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 214, 108, 50, 14
+END

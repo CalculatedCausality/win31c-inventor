@@ -1,0 +1,12 @@
+system windows
+name out/house.exe
+file out/house.obj
+file out/persist.obj
+file out/cad_export.obj
+file out/cad_drawing.obj
+file out/cad_macro.obj
+library commdlg
+option quiet
+option description 'House CAD 0.2 - Win16'
+option stack=8k
+option heapsize=1k

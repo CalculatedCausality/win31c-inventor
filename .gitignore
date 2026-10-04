@@ -1,0 +1,17 @@
+# Compiler outputs and emulator disk images
+/out/
+/debug/.cache/
+__pycache__/
+*.err
+*.obj
+*.o
+*.map
+*.dis
+
+# Local documents and recoverable-save sidecars
+*.H31
+*.h31
+*.BAK
+*.bak
+*.TMP
+*.tmp

@@ -1,0 +1,10 @@
+{
+  "compiler": "Open Watcom v2",
+  "snapshot": "2026-10-01-Build",
+  "archive": "https://github.com/open-watcom/open-watcom-v2/releases/download/2026-10-01-Build/ow-snapshot.tar.xz",
+  "sha256": "e6aa1b1e40ac8bbf97658d2c70fff8a4242d6ca4a1c60806f2baa5317083d4fe",
+  "target": "Windows 3.1 Win16 / 80286 / segmented large model for CAD, small model for legacy demos",
+  "build": "sh build.sh cad",
+  "install": "$HOME/opt/openwatcom (override with WATCOM=...)",
+  "setup": "mkdir -p ~/opt/openwatcom && curl -fL <archive> | tar -xJ -C ~/opt/openwatcom; verify sha256 of the archive first"
+}

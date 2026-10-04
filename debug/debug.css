@@ -1,0 +1,17 @@
+:root { color-scheme: dark; font: 14px system-ui, sans-serif; background: #151a21; color: #e2e9f0; }
+body { margin: 0; } header, details { padding: 6px 10px; } header { background: #232d39; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; margin: 5px 0; }
+button { cursor: pointer; padding: 4px 7px; } output { display: block; font-family: monospace; font-size: 12px; }
+#error { color: #ffb9ad; white-space: pre-wrap; } main { padding: 0; }
+#cad { width: min(100%, calc((100dvh - 115px) * 4 / 3)); max-width: none; margin: auto; color: #111; color-scheme: light; }
+#cad canvas { max-width: 100%; height: auto; display: block; margin: auto; image-rendering: pixelated; }
+#cad .pcjs-container, #cad .pcjs-chassis, #cad .pcjs-chassis-clear {
+    border: 0 !important; border-radius: 0 !important;
+    padding: 0 !important; background: transparent !important;
+}
+/* Bindings remain in the DOM for our toolbar, but the native chrome is hidden. */
+#cad h3, #cad .pcjs-name, #cad .pcjs-title, #cad .pcjs-controls,
+#cad .pcjs-copyright, #cad .pcjs-reference { display: none !important; }
+#cad .pcjs-video { padding: 0; }
+details { max-width: 960px; margin: auto; line-height: 1.5; } textarea { width: 80%; }
+a { color: #9cceff; }
