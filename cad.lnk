@@ -19,6 +19,7 @@ file out/cad_assembly.obj
 file out/cad_parts.obj
 file out/cad_features.obj
 file out/cad_featureui.obj
+file out/cad_chrome.obj
 library commdlg
 option resource=out/cad.res
 option description 'Win31 CAD - Generic document editor'

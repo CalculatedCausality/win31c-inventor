@@ -44,6 +44,24 @@ def status_text(image):
     return recognize(strip, line=True)
 
 
+# Guest layout (640x480, maximized): caption + menu bar end at y=40, the
+# ribbon is 92 rows (cad_chrome.h), so the viewport starts at CANVAS_TOP.
+# Right of the viewport: ViewCube (top), Home button left of it and the
+# navigation bar below it; VIEW_RIGHT excludes that column from geometry.
+CANVAS_TOP = 40 + 92
+VIEW_RIGHT = 180
+# Background dither / grid colour: VGA silver as the guest renders it.
+SILVER = (192, 196, 200)
+
+
+def chrome_rects(image):
+    """Viewport chrome drawn over the scene: ViewCube, Home, navigation bar."""
+    w = image.width
+    return [(w - 142, CANVAS_TOP, w, CANVAS_TOP + 140),
+            (w - 180, CANVAS_TOP + 2, w - 138, CANVAS_TOP + 44),
+            (w - 36, CANVAS_TOP + 134, w, CANVAS_TOP + 240)]
+
+
 STATE_MAGIC = ((255, 0, 255), (255, 255, 0), (0, 255, 255), (255, 0, 255))
 FEATURE_MAGIC = ((0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 255))
 
@@ -99,15 +117,86 @@ def telemetry_word(image, magic, constant):
     return None
 
 
+RENDER_MAGIC = ((255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0))
+
+
+def render_state(image):
+    """Third /UITEST strip (status rows 5-6): scene renders, cache, pending."""
+    low = telemetry_word(image, RENDER_MAGIC, 0x3e)
+    if low is None:
+        return None
+    return {'renders': low & 0xffff, 'cached': bool(low & (1 << 16)), 'pending': bool(low & (1 << 17))}
+
+
+def ribbon_tint(image):
+    """Cyan pixels in the ribbon: a few in icon artwork at rest; a hovered
+    button's tint (2/16 cyan dither) adds about a hundred or more."""
+    data = image.crop((0, 40, image.width, 40 + 92)).convert('RGB').tobytes()
+    return sum(data[i] < 20 and data[i + 1] > 240 and data[i + 2] > 240 for i in range(0, len(data), 3))
+
+
+async def hover_sweep(page):
+    """Hover must never render the scene. Guest mouse input is relative
+    (about half a guest pixel per browser pixel) and its position cannot be
+    read back, so: climb to the top edge (moving up inside the canvas and
+    returning outside it, where the emulator sees no events), then sweep the
+    screen in zig-zag rows over ribbon, tabs, ViewCube, Home and nav bar."""
+    box = await page.evaluate("(() => { const r = document.querySelector('#cad canvas').getBoundingClientRect();"
+                              " return [r.left, r.top, r.width, r.height]; })()")
+    left, top, width, height = box
+    async def path(points, step=4):
+        x, y = points[0]
+        await page.mouse.move(x, y)
+        for nx, ny in points[1:]:
+            n = int(max(abs(nx - x), abs(ny - y)) // step) or 1
+            for i in range(1, n + 1):
+                await page.mouse.move(x + (nx - x) * i / n, y + (ny - y) * i / n)
+                await page.wait_for_timeout(8)
+            x, y = nx, ny
+    before = await settled(page)
+    start = render_state(before)
+    assert start, 'render telemetry missing'
+    middle = left + width / 2
+    for _ in range(3):
+        await path([(middle, top + height + 8), (middle, top + height - 2), (middle, top + 2), (middle, top - 8)])
+        await path([(middle, top - 8), (left - 8, top - 8), (left - 8, top + height + 8), (middle, top + height + 8)], 40)
+    await path([(left - 8, top + 2), (left + 2, top + 2)])
+    baseline = ribbon_tint(before)
+    tinted, x = 0, left + 2
+    for row in range(14):
+        y = top + 2 + row * 44
+        target = left + width - 2 if row % 2 == 0 else left + 2
+        for k in range(1, 5):
+            await path([(x, y), (x + (target - x) * k / 4, y)])
+            image = await frame(page)
+            tinted += ribbon_tint(image) > baseline + 40
+            state = render_state(image)
+            # A frame grabbed mid status-bar repaint has no strip; skip it.
+            assert state is None or state['renders'] == start['renders'], (start, state)
+        x = target
+        await path([(x, y), (x, y + 44)])
+    after = await settled(page)
+    after.save(OUTPUT / 'hover-sweep-end.png')
+    end = render_state(after)
+    print(f"hover: renders {start['renders']} -> {end['renders']}, scene cache={end['cached']}, "
+          f"frames with ribbon hover tint={tinted}", flush=True)
+    assert end['renders'] == start['renders'], (start, end)
+    # Non-vacuous: the sweep must actually have produced hover feedback.
+    assert tinted >= 1, 'the sweep never hovered a ribbon button'
+
+    return end
+
+
 def geometry_box(image):
     """Bounding box (width, height) of geometry-pen pixels in the viewport,
     skipping the ViewCube corner; None if nothing is drawn."""
     rgb = image.convert('RGB')
     pixels = rgb.load()
     xs, ys = [], []
-    for y in range(108, image.height - 28):
+    skip = chrome_rects(image)
+    for y in range(CANVAS_TOP + 4, image.height - 28):
         for x in range(162, image.width - 4):
-            if x >= image.width - 142 and y < 250:
+            if any(x0 <= x < x1 and y0 <= y < y1 for x0, y0, x1, y1 in skip):
                 continue
             if min(pixels[x, y]) < 120:
                 xs.append(x)
@@ -121,14 +210,14 @@ def feature_pixels(image):
     """Viewport pixels drawn by geometry pens (black body edges, blue sketch
     curves, red selection, shaded faces); the light grid and dimmed lines are
     excluded."""
-    region = image.crop((182, 108, image.width - 145, image.height - 28))
+    region = image.crop((182, CANVAS_TOP + 4, image.width - VIEW_RIGHT, image.height - 28))
     data = region.convert('RGB').tobytes()
     return sum(min(data[i:i + 3]) < 120 for i in range(0, len(data), 3))
 
 
 def cube_region(image):
     # ViewCube sits in the top-right corner of the canvas, below the ribbon.
-    return image.crop((image.width - 140, 105, image.width - 4, 245)).convert('L')
+    return image.crop((image.width - 140, CANVAS_TOP + 1, image.width - 4, CANVAS_TOP + 136)).convert('L')
 
 
 def cube_difference(a, b):
@@ -152,9 +241,11 @@ async def settled(page, timeout=90):
     previous = None
     while loop.time() < deadline:
         image = await frame(page)
-        if rendered_state(image) and previous is not None and image.tobytes() == previous.tobytes():
+        # The scene renders off-screen: wait until no render is pending.
+        ready = rendered_state(image) and not (render_state(image) or {}).get('pending')
+        if ready and previous is not None and image.tobytes() == previous.tobytes():
             return image
-        previous = image if rendered_state(image) else None
+        previous = image if ready else None
         await page.wait_for_timeout(1500)
     raise AssertionError('guest frame never settled')
 
@@ -164,16 +255,17 @@ def cube_drawn(image):
 
 
 def surface_pixels(image):
-    # Only the guest's modeling viewport: exclude ribbon, browser, cube and status.
-    region = image.crop((182, 108, image.width - 145, image.height - 28))
+    # Only the guest's modeling viewport: exclude ribbon, browser, cube and
+    # status. The background gradient and the grid are white/silver only.
+    region = image.crop((182, CANVAS_TOP + 4, image.width - VIEW_RIGHT, image.height - 28))
     data = region.convert('RGB').tobytes()
-    return sum(min(data[i:i + 3]) < 235 for i in range(0, len(data), 3))
+    return sum(min(data[i:i + 3]) < 235 and tuple(data[i:i + 3]) != SILVER for i in range(0, len(data), 3))
 
 
 def component_pixels(image):
     """Placed components: dark blue (0,0,160 -> VGA 0,0,168) or, when
     selected, the 2px red selection pen. Empty documents draw neither."""
-    region = image.crop((182, 108, image.width - 145, image.height - 28))
+    region = image.crop((182, CANVAS_TOP + 4, image.width - VIEW_RIGHT, image.height - 28))
     data = region.convert('RGB').tobytes()
     count = 0
     for i in range(0, len(data), 3):
@@ -214,6 +306,28 @@ async def modify_parameter(page, name, value):
     await keys(page, '$esc$10')
 
 
+CHROME_TABS = ('model', 'sketch', 'assemble', 'constrain', 'manage', 'view')
+
+
+async def chrome_screens(page, headed, prefix):
+    """View > Ribbon tab > 1..6: screenshot every ribbon tab for review."""
+    await progress(page, 'Ribbon tabs: chrome screenshots', headed)
+    images = []
+    for index, name in enumerate(CHROME_TABS):
+        await keys(page, '$altv$10r$10')
+        await page.evaluate('(text) => cadDebug.type(text)', str(index + 1))
+        await page.wait_for_timeout(2500)
+        image = await settled(page)
+        image.save(OUTPUT / f'chrome-{prefix}-{name}.png')
+        images.append(image)
+    # Each tab paints a different ribbon body.
+    bodies = [image.crop((0, 40 + 23, image.width, 40 + 77)).tobytes() for image in images]
+    assert len(set(bodies)) == len(bodies), 'ribbon tabs did not repaint'
+    await keys(page, '$altv$10r$10')
+    await page.evaluate('(text) => cadDebug.type(text)', '1')
+    await page.wait_for_timeout(2000)
+
+
 async def part_feature_steps(page, headed):
     """Inventor-style part: W=100, sketch rectangle W x 60, extrude 40,
     then W=200 must widen the body (associativity); save/reopen."""
@@ -251,6 +365,8 @@ async def part_feature_steps(page, headed):
     await page.wait_for_timeout(1000)
     await keys(page, '$enter$10')
     await features_are(page, 'feat-rectangle', lambda f, image: f.get('bounds') and f.get('extent_x') == 100)
+    # Entering sketch mode switched the ribbon to the Sketch tab.
+    (await settled(page)).save(OUTPUT / 'chrome-sketch-mode.png')
     await progress(page, 'Finish Sketch, then Extrude 40', headed)
     await keys(page, '$altp$10f$10')
     await features_are(page, 'feat-finished', lambda f, image: f.get('features') == 1 and not f.get('sketch_mode'))
@@ -280,6 +396,7 @@ async def part_feature_steps(page, headed):
                                 (rendered_state(image) or {}).get('shaded'))
     shaded = await settled(page)
     print(f'features: shaded pixels={surface_pixels(shaded)} wire={surface_pixels(narrow)}', flush=True)
+    await chrome_screens(page, headed, 'shaded')
     # Filled faces cover far more of the viewport than the 12 body edges.
     assert surface_pixels(shaded) - surface_pixels(narrow) > 3000, (surface_pixels(shaded), surface_pixels(narrow))
     await keys(page, '$altv$10w$10')
@@ -305,9 +422,12 @@ async def part_feature_steps(page, headed):
     await page.wait_for_timeout(3000)
     await progress(page, 'Parameters: W = 1000 puts Sketch1 in error, Extrusion1 blocked', headed)
     await modify_parameter(page, 'feat-w1000', '1000')
-    failed = await features_are(page, 'feat-error', lambda f, image: f.get('errors') == 2 and not f.get('bounds'))
+    await features_are(page, 'feat-error', lambda f, image: f.get('errors') == 2 and not f.get('bounds'))
+    failed = await settled(page)
+    failed.save(OUTPUT / 'chrome-browser-error.png')
     # Diagnostic only: the selected (inverted) row is not OCR-readable.
-    browser_rows = failed.crop((0, 128, 156, failed.height - 30)).convert('L').resize((312, (failed.height - 158) * 2))
+    top = CANVAS_TOP + 22
+    browser_rows = failed.crop((0, top, 156, failed.height - 30)).convert('L').resize((312, (failed.height - 30 - top) * 2))
     print('features: browser OCR in error state:', repr(recognize(browser_rows)), flush=True)
     await modify_parameter(page, 'feat-w200-again', '200')
     await features_are(page, 'feat-healed', lambda f, image: f.get('errors') == 0 and f.get('extent_x') == 200)
@@ -527,6 +647,15 @@ async def main(headed=False, hold=False, windows=False):
             back_image.save(OUTPUT / 'viewcube-iso.png')
             assert cube_difference(iso_image, back_image) < 80, cube_difference(iso_image, back_image)
             print('PASS: viewcube-isometric-restored', flush=True)
+            await progress(page, 'Hover over ribbon, ViewCube and nav bar never re-renders the 747', headed)
+            hovered = await hover_sweep(page)
+            print('PASS: hover-without-render', flush=True)
+            await keys(page, '$altv$10f$10')
+            await page.wait_for_timeout(3000)
+            front = render_state(await settled(page))
+            print(f"camera change: renders {hovered['renders']} -> {front['renders']}", flush=True)
+            assert front['renders'] == hovered['renders'] + 1, (hovered, front)
+            print('PASS: camera-change-renders-once', flush=True)
             assert not errors, errors
             await progress(page, 'PASS — generic CAD, Boeing 747 shaded/wireframe and ViewCube tests. You can use CAD now.', False)
             print('PASS: generic CAD guest UI tests', flush=True)

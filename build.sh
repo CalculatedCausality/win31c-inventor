@@ -40,6 +40,8 @@ for p do
                 params userparams constraints vconstraints script assembly parts features featureui; do
             "$WATCOM/binl64/wcc" $cadflags "-fo=out/cad_$module.obj" "cad_$module.c"
         done
+        # Window chrome (ribbon, browser tree, navigation bar): Win16 GDI only.
+        "$WATCOM/binl64/wcc" $cadflags -we -fo=out/cad_chrome.obj cad_chrome.c
         "$WATCOM/binl64/wrc" -q -bt=windows -31 -r -fo=out/cad.res cad.rc
     else
         "$WATCOM/binl64/wcc" $CFLAGS "-fo=out/$p.obj" "$p.c"

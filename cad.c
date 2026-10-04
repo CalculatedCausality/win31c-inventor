@@ -23,9 +23,12 @@
 #include "cad_parts.h"
 #include "cad_featureui.h"
 #include "cad_ui_ids.h"
+#include "cad_chrome.h"
 
 #define SIDE_WIDTH 154
-#define RIBBON_HEIGHT 64
+/* = CHROME_RIBBON_HEIGHT (cad_chrome.h); the browser caption strip follows. */
+#define RIBBON_HEIGHT 92
+#define BROWSER_TITLE 22
 #define CANVAS_LEFT (SIDE_WIDTH + 1)
 #define STATUS_HEIGHT 24
 #define GRIP 3
@@ -36,6 +39,9 @@
 #define G_GRIP 1
 #define G_ORBIT 2
 #define G_CUBE 3
+/* Navigation bar modes (left-drag): pan and zoom. */
+#define G_PAN 4
+#define G_ZOOM 5
 #define TIMER_CAPTURE 1
 #define PICK_MACRO (-2)
 /* Browser item data: vertex ID, 0x10000|edge ID, header, 0x80000000|constraint,
@@ -62,8 +68,10 @@ static CadVConstraints constraints;
 static CadVConstraints loadConstraints;
 static CadVcMoves vcMoves;
 static CadVcStatus vcFailure;
-static char savedParamText[SECTION_TEXT], savedVcText[SECTION_TEXT];
-static char sectionScratch[SECTION_TEXT];
+/* NEAR (DGROUP has room): -zt=1 packs this module's far BSS segments full,
+ * and the window chrome globals pushed them to exactly 64 KiB. */
+static char NEAR savedParamText[SECTION_TEXT], NEAR savedVcText[SECTION_TEXT];
+static char NEAR sectionScratch[SECTION_TEXT];
 static char extText[EXT_BYTES];
 /* Placed components (Insert > Place Component). Only one live CadParts may
  * exist per process (cad_parts.c owns the part models, ~4 KiB here). Component
@@ -101,7 +109,8 @@ static const char *const NEAR aboutText[] = {
     "Finish Sketch, Extrude and Revolve; every value may use fx names.\n",
     "Features regenerate on each parameter change; the browser shows\n",
     "(!) errors, (blocked), (suppressed). Double-click to edit; Del removes.\n\n",
-    "Select in browser; drag vertex grips. Right-drag orbits.\n",
+    "Select in browser; drag vertex grips. Right-drag orbits; the bar\n",
+    "under the ViewCube adds Pan/Zoom/Orbit drag modes (Esc ends).\n",
     "Arrows: selected X/Z; PgUp/PgDn: Y; Tab: next vertex.\n",
     "Enter: coordinates; Esc: cancel drag / clear selection.\n\n",
     "Parameters (fx): Tools or Manage tab. Dialog fields accept\n",
@@ -123,7 +132,7 @@ static const char *const NEAR aboutText[] = {
     "No booleans, holes or curved kernel.",
     NULL
 };
-static char about[1700];
+static char NEAR about[1700];
 /* Exact saved geometry, independent of history eviction and load scratch.
  * Compare by ID, not dense order, and ignore allocator/history metadata. */
 static CadVertex savedVertices[CAD_MAX_VERTICES];
@@ -143,7 +152,8 @@ static BOOL captureTimer;
 static HPEN edgePen, gridPen, selectedPen, componentPen;
 /* Sketch curves (blue), the active sketch (thick blue), dimmed geometry. */
 static HPEN sketchPen, activePen, dimPen;
-static HBRUSH hotBrush, secondBrush;
+/* preBrush: pre-highlighted (hovered) vertex grip. */
+static HBRUSH hotBrush, secondBrush, NEAR preBrush;
 static char filePath[PATH_BYTES];
 /* selected2: second vertex (Ctrl/Shift+click) for two-vertex constraints. */
 static CadId selected, selectedEdge, selected2;
@@ -174,6 +184,19 @@ static BOOL uiTestMode;
 static int ribbonTab;
 static CadCubeGeometry viewCube;
 static int cubeHover, cubePending;
+/* Window chrome (cad_chrome.c): hot/pressed ribbon item, hot navigation
+ * button, navigation mode (ID_VIEW_PAN/ZOOM/ORBIT or 0), pre-highlighted
+ * vertex index, sketch-mode state behind the automatic tab switch, and the
+ * last viewport paint's fill state for status-only repaints. */
+static HWND NEAR mainWindow;
+static int NEAR ribbonHot, NEAR ribbonPressed, NEAR navHot, NEAR navMode;
+static int NEAR hoverVertex = -1;
+static BOOL NEAR sketchTabMode, NEAR lastFilled, NEAR lastFeatureFilled;
+static double NEAR startScale, NEAR startCenterX, NEAR startCenterY, NEAR startCenterZ;
+/* Scene cache (cad_chrome_scene_dc) holds the current scene; scene renders
+ * are counted for /UITEST telemetry. */
+static BOOL NEAR sceneValid;
+static unsigned NEAR sceneRenders;
 static HBRUSH aircraftBrushes[CAD_AIRCRAFT_MATERIAL_COUNT * 8];
 static CadMeshViewVertex meshVertices[CAD_AIRCRAFT_MAX_VERTICES];
 static CadMeshViewFace meshFaces[CAD_AIRCRAFT_MAX_TRIANGLES];
@@ -381,82 +404,127 @@ static void ModelResult(HWND hwnd, CadStatus status)
     if (status != CAD_OK) Error(hwnd, vcFailure ? VcMessage(vcFailure) : cad_model_status_string(status));
     vcFailure = CAD_VC_OK;
 }
+/* Browser tree rows (owner-drawn by cad_chrome.c): "Part1" root with the
+ * Origin folder, features and End of Part, then the Constraints, Components
+ * and Wireframe folders. Folders and origin entries carry BROWSER_HEADER. */
+#define ICON(name) (IDB_##name - IDB_ICON_FIRST)
+#define ROW_ORIGIN 0x100UL
+#define ROW_END_OF_PART 0x200UL
+static int AddRow(const char *text, DWORD data, int level, int icon, int flags)
+{
+    int row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
+    if (row < 0) return row;
+    SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)data);
+    cad_chrome_tree_set(row, level, icon, flags);
+    return row;
+}
+static BOOL AddFolder(const char *text, int folder, int level, int icon)
+{
+    int row = AddRow(text, BROWSER_HEADER | (DWORD)folder, level, icon, folder == CHROME_FOLDER_PART ? CHROME_TREE_BOLD : 0);
+    cad_chrome_tree_set_folder(row, folder);
+    return cad_chrome_folder_open(folder);
+}
 static void SyncBrowser(void)
 {
-    int i, row, profileIndex;
-    unsigned featureId;
-    char text[100], line[260];
+    static const char *const NEAR originNames[7] = {
+        "YZ Plane", "XZ Plane", "XY Plane", "X Axis", "Y Axis", "Z Axis", "Center Point"
+    };
+    int i, row, profileIndex, flags, icon;
+    unsigned featureId, active = cad_fui_active_sketch();
+    char text[100], line[260], *shown, *dot;
+    const char *base;
     CadVertex *v;
     CadEdge *e;
     const CadVConstraint *c;
+    CadFeatInfo info;
     if (!browser) return;
     SendMessage(browser, WM_SETREDRAW, FALSE, 0);
     SendMessage(browser, LB_RESETCONTENT, 0, 0);
-    /* Feature tree first, as Inventor's browser: Part, features, profiles. */
-    if (cad_fui_count()) {
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)"Part");
-        if (row >= 0) SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)BROWSER_HEADER);
+    cad_chrome_tree_reset();
+    /* Root: the document name without folder and extension, else Part1. */
+    base = filePath;
+    for (i = 0; filePath[i]; ++i) if (filePath[i] == '\\' || filePath[i] == ':' || filePath[i] == '/') base = filePath + i + 1;
+    strncpy(text, *base ? base : "Part1", 40); text[40] = 0;
+    dot = strchr(text, '.'); if (dot) *dot = 0;
+    if (AddFolder(text, CHROME_FOLDER_PART, 0, ICON(B_PART))) {
+        if (AddFolder("Origin", CHROME_FOLDER_ORIGIN, 1, ICON(B_ORIGIN)))
+            for (i = 0; i < 7; ++i)
+                AddRow(originNames[i], BROWSER_HEADER | (ROW_ORIGIN + i), 2,
+                    i < 3 ? ICON(B_PLANE) : i < 6 ? ICON(B_AXIS) : ICON(B_POINT), 0);
+        /* Features in tree order; health markers become icons/colours. */
+        for (i = 0; cad_fui_row((unsigned)i, line, sizeof(line), &featureId, &profileIndex); ++i) {
+            shown = line; flags = 0;
+            while (*shown == ' ') ++shown;
+            if (!strncmp(shown, "(!) ", 4)) { shown += 4; flags = CHROME_TREE_ERROR; }
+            else if (!strncmp(shown, "(blocked) ", 10) || !strncmp(shown, "(suppressed) ", 13)) flags = CHROME_TREE_GREY;
+            if (profileIndex < 0 && featureId == active) flags |= CHROME_TREE_BOLD;
+            if (flags & CHROME_TREE_ERROR) icon = ICON(B_ERROR);
+            else if (profileIndex >= 0) icon = ICON(B_PROFILE);
+            else if (cad_features_get(cad_fui_features(), featureId, &info) != CAD_FEAT_OK) icon = ICON(B_SKETCH);
+            else icon = info.type == CAD_FEAT_EXTRUDE ? ICON(B_EXTRUDE) : info.type == CAD_FEAT_REVOLVE ?
+                ICON(B_REVOLVE) : ICON(B_SKETCH);
+            row = AddRow(shown, BROWSER_FEATURE | ((DWORD)(profileIndex + 1) << 16) | featureId,
+                profileIndex >= 0 ? 2 : 1, icon, flags);
+            if (row >= 0 && selectedFeature == featureId && selectedProfile == profileIndex)
+                SendMessage(browser, LB_SETCURSEL, row, 0);
+        }
+        AddRow("End of Part", BROWSER_HEADER | ROW_END_OF_PART, 1, ICON(B_EOP), 0);
     }
-    for (i = 0; cad_fui_row((unsigned)i, line, sizeof(line), &featureId, &profileIndex); ++i) {
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)line);
-        if (row < 0) continue;
-        SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_FEATURE |
-            ((DWORD)(profileIndex + 1) << 16) | featureId));
-        if (selectedFeature == featureId && selectedProfile == profileIndex)
-            SendMessage(browser, LB_SETCURSEL, row, 0);
-    }
-    for (i=0; i<(int)model.vertex_count; ++i) {
-        v = &model.vertices[i];
-        sprintf(text, "V%u  (%ld,%ld,%ld)%s", v->id, v->x, v->y, v->z,
-            selected2 == v->id ? " [2nd]" : "");
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
-        if (row >= 0) {
-            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(DWORD)v->id);
-            if (selected == v->id) SendMessage(browser, LB_SETCURSEL, row, 0);
+    if (constraints.count && AddFolder("Constraints", CHROME_FOLDER_CONSTRAINTS, 0, ICON(B_FOLDER))) {
+        for (i=0; i<constraints.count; ++i) {
+            c = &constraints.items[i];
+            if (cad_vc_describe(c, text, sizeof(text)) != CAD_VC_OK) continue;
+            row = AddRow(text, BROWSER_CONSTRAINT | c->id, 1,
+                c->health == CAD_VC_SICK ? ICON(B_ERROR) : ICON(B_CONSTR),
+                c->health == CAD_VC_SICK ? CHROME_TREE_ERROR : 0);
+            if (row >= 0 && selectedConstraint == c->id) SendMessage(browser, LB_SETCURSEL, row, 0);
         }
     }
-    for (i=0; i<(int)model.edge_count; ++i) {
-        e = &model.edges[i];
-        sprintf(text, "E%u  V%u - V%u", e->id, e->a, e->b);
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
-        if (row >= 0) {
-            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_EDGE | e->id));
-            if (selectedEdge == e->id) SendMessage(browser, LB_SETCURSEL, row, 0);
+    if (cad_parts_count(&parts) && AddFolder("Components", CHROME_FOLDER_COMPONENTS, 0, ICON(B_FOLDER))) {
+        for (i=0; i<(int)cad_parts_count(&parts); ++i) {
+            CadAssemblyId id;
+            CadPartsInfo info;
+            if (cad_parts_at(&parts, (unsigned)i, &id) != CAD_PARTS_OK ||
+                cad_parts_get(&parts, id, &info) != CAD_PARTS_OK) continue;
+            sprintf(text, "%s%s%s", info.name, info.missing ? " (missing)" : "",
+                info.grounded ? " (grounded)" : "");
+            row = AddRow(text, BROWSER_COMPONENT | id, 1, info.missing ? ICON(B_ERROR) : ICON(B_COMP),
+                info.missing ? CHROME_TREE_ERROR : 0);
+            if (row >= 0 && selectedComponent == id) SendMessage(browser, LB_SETCURSEL, row, 0);
         }
     }
-    if (constraints.count) {
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)"Constraints");
-        if (row >= 0) SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)BROWSER_HEADER);
-    }
-    for (i=0; i<constraints.count; ++i) {
-        c = &constraints.items[i];
-        strcpy(text, "  ");
-        if (cad_vc_describe(c, text + 2, sizeof(text) - 2) != CAD_VC_OK) continue;
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
-        if (row >= 0) {
-            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_CONSTRAINT | c->id));
-            if (selectedConstraint == c->id) SendMessage(browser, LB_SETCURSEL, row, 0);
+    /* Wireframe vertices/edges: up to 768 rows, so collapsed by default. */
+    sprintf(text, "Wireframe (%u V, %u E)", model.vertex_count, model.edge_count);
+    if ((model.vertex_count || model.edge_count) && AddFolder(text, CHROME_FOLDER_WIREFRAME, 0, ICON(B_FOLDER))) {
+        for (i=0; i<(int)model.vertex_count; ++i) {
+            v = &model.vertices[i];
+            sprintf(text, "V%u  (%ld,%ld,%ld)%s", v->id, v->x, v->y, v->z,
+                selected2 == v->id ? " [2nd]" : "");
+            row = AddRow(text, (DWORD)v->id, 1, ICON(B_VERTEX), 0);
+            if (row >= 0 && selected == v->id) SendMessage(browser, LB_SETCURSEL, row, 0);
         }
-    }
-    if (cad_parts_count(&parts)) {
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)"Components");
-        if (row >= 0) SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)BROWSER_HEADER);
-    }
-    for (i=0; i<(int)cad_parts_count(&parts); ++i) {
-        CadAssemblyId id;
-        CadPartsInfo info;
-        if (cad_parts_at(&parts, (unsigned)i, &id) != CAD_PARTS_OK ||
-            cad_parts_get(&parts, id, &info) != CAD_PARTS_OK) continue;
-        sprintf(text, "  %s%s%s", info.name, info.missing ? " (missing)" : "",
-            info.grounded ? " (grounded)" : "");
-        row = (int)SendMessage(browser, LB_ADDSTRING, 0, (LPARAM)(LPSTR)text);
-        if (row >= 0) {
-            SendMessage(browser, LB_SETITEMDATA, row, (LPARAM)(BROWSER_COMPONENT | id));
-            if (selectedComponent == id) SendMessage(browser, LB_SETCURSEL, row, 0);
+        for (i=0; i<(int)model.edge_count; ++i) {
+            e = &model.edges[i];
+            sprintf(text, "E%u  V%u - V%u", e->id, e->a, e->b);
+            row = AddRow(text, BROWSER_EDGE | e->id, 1, ICON(B_EDGE), 0);
+            if (row >= 0 && selectedEdge == e->id) SendMessage(browser, LB_SETCURSEL, row, 0);
         }
     }
     SendMessage(browser, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(browser, NULL, TRUE);
+}
+/* Expands/collapses the folder on a browser row, keeping the scroll position. */
+static void ToggleFolder(int row, int open)
+{
+    int folder = cad_chrome_tree_folder(row), top;
+    if (folder < 0) return;
+    if (open < 0) open = !cad_chrome_folder_open(folder);
+    if (open == cad_chrome_folder_open(folder)) return;
+    top = (int)SendMessage(browser, LB_GETTOPINDEX, 0, 0);
+    cad_chrome_folder_set(folder, open);
+    SyncBrowser();
+    SendMessage(browser, LB_SETCURSEL, row, 0);
+    SendMessage(browser, LB_SETTOPINDEX, top, 0);
 }
 static BOOL AircraftTopology(void)
 {
@@ -540,6 +608,16 @@ static void UpdateUI(HWND hwnd)
     CheckMenuItem(menu, ID_VIEW_SHADED, MF_BYCOMMAND | (shaded ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(menu, ID_VIEW_SHADED, MF_BYCOMMAND |
         (aircraftPresent || cad_fui_output()->face_count ? MF_ENABLED : MF_GRAYED));
+    /* Entering sketch mode shows the Sketch tab; leaving it, 3D Model. */
+    if ((cad_fui_active_sketch() != 0) != sketchTabMode) {
+        sketchTabMode = cad_fui_active_sketch() != 0;
+        ribbonTab = sketchTabMode ? CHROME_TAB_SKETCH : CHROME_TAB_MODEL;
+    }
+    for (two = 0; two < CHROME_TABS; ++two)
+        CheckMenuItem(menu, ID_RIBBON_TAB0 + two, MF_BYCOMMAND | ((int)two == ribbonTab ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, ID_VIEW_ORBIT, MF_BYCOMMAND | (navMode == ID_VIEW_ORBIT ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, ID_VIEW_PAN, MF_BYCOMMAND | (navMode == ID_VIEW_PAN ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, ID_VIEW_ZOOM, MF_BYCOMMAND | (navMode == ID_VIEW_ZOOM ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, ID_TOOLS_SNAP, MF_BYCOMMAND | (snap ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, ID_TOOLS_UNSPECIFIED, MF_BYCOMMAND |
         (model.units == CAD_UNITS_UNSPECIFIED ? MF_CHECKED : MF_UNCHECKED));
@@ -566,13 +644,23 @@ static void SyncFeatures(void)
     } else if (selectedProfile >= 0 && (info.type != CAD_FEAT_SKETCH ||
         (unsigned)selectedProfile >= info.profile_count)) selectedProfile = -1;
 }
+/* The only way to request a scene render: geometry, camera, view mode,
+ * selection or document changes. Hover feedback must never call this. */
+static void ShowPending(HWND hwnd);
+static void InvalidateScene(HWND hwnd)
+{
+    sceneValid = FALSE;
+    InvalidateRect(hwnd, NULL, FALSE);
+    ShowPending(hwnd);
+}
 static void Changed(HWND hwnd)
 {
+    hoverVertex = -1;
     SyncFeatures();
     SyncConstraints();
     UpdateUI(hwnd);
     SyncBrowser();
-    InvalidateRect(hwnd, NULL, FALSE);
+    InvalidateScene(hwnd);
 }
 static void EndGesture(HWND hwnd, BOOL accept)
 {
@@ -584,6 +672,9 @@ static void EndGesture(HWND hwnd, BOOL accept)
         else status = cad_model_cancel(&model);
     } else if (old == G_ORBIT && !accept) {
         yaw = startYaw; pitch = startPitch;
+    } else if ((old == G_PAN || old == G_ZOOM) && !accept) {
+        centerX = startCenterX; centerY = startCenterY; centerZ = startCenterZ;
+        scale = startScale; focal = (long)(scale * 1024.0); if (focal < 1) focal = 1;
     }
     if (old && GetCapture() == hwnd) ReleaseCapture();
     if (old) Changed(hwnd);
@@ -909,104 +1000,93 @@ static BOOL DrawAircraft(HDC dc)
     return result == CAD_MESHVIEW_OK;
 }
 
-typedef struct RibbonButton { const char *label; int command, span; } RibbonButton;
-static const RibbonButton NEAR modelButtons[] = {
-    {"Extrude",ID_FEATURE_EXTRUDE,60}, {"Revolve",ID_FEATURE_REVOLVE,60},
-    {"Box",ID_CREATE_BOX,40}, {"Properties",ID_EDIT_PROPERTIES,74},
-    {"Undo",ID_EDIT_UNDO,46}, {"Redo",ID_EDIT_REDO,46},
-    {"Wireframe",ID_VIEW_WIREFRAME,74}, {"Shaded",ID_VIEW_SHADED,58}, {"Fit",ID_VIEW_FIT,36}
-};
-/* Part sketches (feature tree); Line stays a direct wireframe tool. */
-static const RibbonButton NEAR sketchButtons[] = {
-    {"Start 2D Sketch",ID_FEATURE_SKETCH,104}, {"Rectangle",ID_FEATURE_RECT,70},
-    {"Circle",ID_FEATURE_CIRCLE,50}, {"Polygon",ID_FEATURE_POLY,58},
-    {"Finish Sketch",ID_FEATURE_FINISH,90}, {"Line",ID_CREATE_LINE,40},
-    {"Snap",ID_TOOLS_SNAP,42}, {"Undo",ID_EDIT_UNDO,44}, {"Fit",ID_VIEW_FIT,36}
-};
-static const RibbonButton NEAR viewButtons[] = {
-    {"Front",ID_VIEW_FRONT,48}, {"Top",ID_VIEW_TOP,40},
-    {"Side",ID_VIEW_SIDE,42}, {"Isometric",ID_VIEW_ISO,76},
-    {"Fit",ID_VIEW_FIT,38}, {"Orbit",ID_VIEW_ORBIT,46},
-    {"Wireframe",ID_VIEW_WIREFRAME,76}, {"Shaded",ID_VIEW_SHADED,60}, {"Grid",ID_VIEW_GRID,42}
-};
-
-static const RibbonButton NEAR constrainButtons[] = {
-    {"Coincident",ID_CONSTRAIN_COINCIDENT,72}, {"Align X",ID_CONSTRAIN_ALIGN_X,56},
-    {"Align Y",ID_CONSTRAIN_ALIGN_Y,56}, {"Align Z",ID_CONSTRAIN_ALIGN_Z,56},
-    {"Distance",ID_CONSTRAIN_DISTANCE,64}, {"Fix",ID_CONSTRAIN_FIX,38},
-    {"Delete",ID_CONSTRAIN_DELETE,54}, {"Undo",ID_EDIT_UNDO,48}
-};
-static const RibbonButton NEAR manageButtons[] = {
-    {"Parameters fx",ID_TOOLS_PARAMETERS,96}, {"Run Macro",ID_TOOLS_RUN_MACRO,76},
-    {"Undo",ID_EDIT_UNDO,48}, {"Redo",ID_EDIT_REDO,48}
-};
-static const RibbonButton NEAR assembleButtons[] = {
-    {"Place",ID_INSERT_PLACE,48}, {"Move",ID_INSERT_MOVE,46},
-    {"Ground",ID_INSERT_GROUND,56}, {"Remove",ID_INSERT_REMOVE,58},
-    {"Reload",ID_INSERT_RELOAD,56}, {"Fit",ID_VIEW_FIT,38}
-};
-#define RIBBON_TABS 6
-static const char *const NEAR tabNames[RIBBON_TABS] = {"3D Model", "Sketch", "View", "Constrain", "Manage", "Assemble"};
-static const int NEAR tabLeft[RIBBON_TABS] = {8, 108, 190, 252, 334, 406};
-static const int NEAR tabRight[RIBBON_TABS] = {102, 184, 246, 328, 400, 478};
-
-static const RibbonButton *RibbonItems(int *count)
-{
-    if (ribbonTab == 1) { *count = sizeof(sketchButtons)/sizeof(sketchButtons[0]); return sketchButtons; }
-    if (ribbonTab == 2) { *count = sizeof(viewButtons)/sizeof(viewButtons[0]); return viewButtons; }
-    if (ribbonTab == 3) { *count = sizeof(constrainButtons)/sizeof(constrainButtons[0]); return constrainButtons; }
-    if (ribbonTab == 4) { *count = sizeof(manageButtons)/sizeof(manageButtons[0]); return manageButtons; }
-    if (ribbonTab == 5) { *count = sizeof(assembleButtons)/sizeof(assembleButtons[0]); return assembleButtons; }
-    *count = sizeof(modelButtons)/sizeof(modelButtons[0]); return modelButtons;
-}
-
-static int RibbonHit(int x, int y)
-{
-    const RibbonButton *items;
-    int i, count, left = 8;
-    if (y < 0 || y >= RIBBON_HEIGHT || x < 0 || x >= width) return 0;
-    if (y < 23) {
-        for (i = 0; i < RIBBON_TABS; ++i)
-            if (x >= tabLeft[i] && x < tabRight[i]) return 10000 + i;
-        return 0;
-    }
-    items = RibbonItems(&count);
-    for (i = 0; i < count; ++i) {
-        if (x >= left && x < left + items[i].span && y >= 27 && y < 56) return items[i].command;
-        left += items[i].span + 5;
-    }
-    return 0;
-}
-
+/* Ribbon (cad_chrome.c); command enable/check state mirrors the menu. */
 static void DrawRibbon(HDC dc)
 {
-    const RibbonButton *items;
-    RECT r;
-    HBRUSH background, active;
-    HGDIOBJ oldFont;
-    int i, count, left = 8;
-    background = CreateSolidBrush(RGB(225,232,240));
-    active = CreateSolidBrush(RGB(255,255,255));
-    oldFont = SelectObject(dc, GetStockObject(ANSI_VAR_FONT));
-    r.left = r.top = 0; r.right = width; r.bottom = RIBBON_HEIGHT;
-    FillRect(dc, &r, background ? background : (HBRUSH)GetStockObject(LTGRAY_BRUSH));
-    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(0,0,0));
-    for (i = 0; i < RIBBON_TABS; ++i) {
-        r.left = tabLeft[i]; r.right = tabRight[i]; r.top = 2; r.bottom = 23;
-        if (ribbonTab == i) FillRect(dc, &r, active ? active : (HBRUSH)GetStockObject(WHITE_BRUSH));
-        DrawText(dc, tabNames[i], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    cad_chrome_ribbon(dc, width, ribbonTab, mainWindow ? GetMenu(mainWindow) : NULL, ribbonHot, ribbonPressed);
+}
+static void TelemetryStrip(HDC dc, int y, DWORD value, const COLORREF *marker);
+/* Third /UITEST strip (rows 5-6 of the status bar, under the other two; the
+ * maximized client extends below the screen, so not the bottom): renders
+ * mod 65536, bit 16 = scene cache allocated, bit 17 = a scene render is
+ * pending (requested, not yet painted). Checksum constant 0x3e. */
+static void RenderStrip(HDC dc)
+{
+    DWORD telemetry, checksum;
+    COLORREF marker[4];
+    telemetry = (DWORD)sceneRenders | ((DWORD)(cad_chrome_scene_cached() ? 1 : 0) << 16) |
+        ((DWORD)(sceneValid ? 0 : 1) << 17);
+    checksum = (telemetry ^ (telemetry >> 8) ^ (telemetry >> 16) ^ 0x3eUL) & 255;
+    telemetry |= checksum << 24;
+    marker[0] = RGB(255,255,0); marker[1] = RGB(0,255,255);
+    marker[2] = RGB(255,0,255); marker[3] = RGB(255,255,0);
+    TelemetryStrip(dc, height - STATUS_HEIGHT + 5, telemetry, marker);
+}
+/* Off-screen scene renders leave the screen unchanged for seconds: publish
+ * "pending" at once so tests never mistake the old frame for the new one. */
+static void ShowPending(HWND hwnd)
+{
+    HDC dc;
+    if (!uiTestMode || width <= 90 || height <= 4 || !(dc = GetDC(hwnd))) return;
+    RenderStrip(dc);
+    ReleaseDC(hwnd, dc);
+}
+/* Status bar: prompt (hover help, navigation mode, sketch mode, selection)
+ * at the left, document counts at the right; /UITEST strips on top. */
+static void DrawStatus(HDC dc)
+{
+    char prompt[160], counts[160];
+    const char *help = ribbonHot ? cad_chrome_help(ribbonHot) : navHot ? cad_chrome_help(navHot) : NULL;
+    unsigned activeSketch = cad_fui_active_sketch();
+    DWORD telemetry, checksum;
+    COLORREF marker[4];
+    CadVertex *v;
+    if (height <= STATUS_HEIGHT) return;
+    if (help) strcpy(prompt, help);
+    else if (hoverVertex >= 0 && hoverVertex < (int)model.vertex_count) {
+        v = &model.vertices[hoverVertex];
+        sprintf(prompt, "V%u (%ld, %ld, %ld): drag to move; Ctrl+click picks a 2nd vertex", v->id, v->x, v->y, v->z);
+    } else if (navMode) sprintf(prompt, "%s: drag in the view; Esc or the button ends it",
+        navMode == ID_VIEW_PAN ? "Pan" : navMode == ID_VIEW_ZOOM ? "Zoom (drag up/down)" : "Orbit");
+    else if (activeSketch) sprintf(prompt, "%.31s: add Rectangle/Circle/Polygon profiles, then Finish Sketch",
+        cad_fui_name(activeSketch));
+    else if (selectedFeature) sprintf(prompt, "%.31s selected: double-click edits, Del removes", cad_fui_name(selectedFeature));
+    else if (selected) sprintf(prompt, "V%u selected%s: arrows/PgUp/PgDn nudge, Enter edits", selected,
+        selected2 ? " (+2nd)" : "");
+    else if (selectedEdge) sprintf(prompt, "E%u selected: Del removes", selectedEdge);
+    else if (selectedConstraint) strcpy(prompt, "Constraint selected: Del removes, double-click edits a distance");
+    else if (selectedComponent) strcpy(prompt, "Component selected: Move, Ground or Remove (Assemble tab)");
+    else strcpy(prompt, "Ready");
+    sprintf(counts, "%u vertices / %u edges | %s%s", model.vertex_count, model.edge_count,
+        sheetView ? "drawing" : lastFilled ? "shaded" : "wireframe", snap ? " | snap" : "");
+    if (model.units != CAD_UNITS_UNSPECIFIED)
+        sprintf(counts + strlen(counts), " | %s", model.units == CAD_UNITS_MM ? "mm" : "in");
+    if (cad_fui_count()) {
+        sprintf(counts + strlen(counts), " | %u feature%s", cad_fui_count(), cad_fui_count() == 1 ? "" : "s");
+        if (cad_fui_errors()) sprintf(counts + strlen(counts), " (%u failed)", cad_fui_errors());
     }
-    items = RibbonItems(&count);
-    for (i = 0; i < count; ++i) {
-        r.left = left; r.right = left + items[i].span; r.top = 27; r.bottom = 56;
-        FillRect(dc, &r, active ? active : (HBRUSH)GetStockObject(WHITE_BRUSH));
-        FrameRect(dc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
-        DrawText(dc, items[i].label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        left += items[i].span + 5;
+    if (cad_userparams_count(&userParams)) sprintf(counts + strlen(counts), " | fx %u", cad_userparams_count(&userParams));
+    if (constraints.count) sprintf(counts + strlen(counts), " | %d constr", constraints.count);
+    if (cad_parts_count(&parts)) sprintf(counts + strlen(counts), " | %u parts", cad_parts_count(&parts));
+    cad_chrome_status(dc, height - STATUS_HEIGHT, width, STATUS_HEIGHT, prompt, counts);
+    /* Debug-only display telemetry follows the real rendered state. It does
+     * not drive commands or modify the document. Normal launches omit it. */
+    if (uiTestMode && width > 90 && height > 4) {
+        telemetry = (DWORD)model.vertex_count | ((DWORD)model.edge_count << 9) |
+            ((DWORD)model.units << 19) | ((DWORD)(lastFilled ? 1 : 0) << 21) |
+            ((DWORD)(Dirty() ? 1 : 0) << 22) |
+            ((DWORD)(cad_parts_count(&parts) ? 1 : 0) << 23);
+        checksum = (telemetry ^ (telemetry >> 8) ^ (telemetry >> 16) ^ 0xa7UL) & 255;
+        telemetry |= checksum << 24;
+        marker[0] = RGB(255,0,255); marker[1] = RGB(255,255,0);
+        marker[2] = RGB(0,255,255); marker[3] = RGB(255,0,255);
+        TelemetryStrip(dc, height-STATUS_HEIGHT + 1, telemetry, marker);
+        /* Second strip (features, see cad_fui_telemetry): own marker order. */
+        marker[0] = RGB(0,255,255); marker[1] = RGB(255,0,255);
+        marker[2] = RGB(255,255,0); marker[3] = RGB(0,255,255);
+        TelemetryStrip(dc, height-STATUS_HEIGHT + 3, cad_fui_telemetry(lastFeatureFilled), marker);
+        RenderStrip(dc);
     }
-    SelectObject(dc, oldFont);
-    if (background) DeleteObject(background);
-    if (active) DeleteObject(active);
 }
 
 static void DrawViewCube(HDC dc)
@@ -1112,28 +1192,36 @@ static void TelemetryStrip(HDC dc, int y, DWORD value, const COLORREF *marker)
         SetPixel(dc, 14 + i * 2, y + 1, color);
     }
 }
-static void Render(HDC dc)
+static const char NEAR emptyHint[]="Empty part - Start 2D Sketch or create wireframe";
+/* Grip fill: selection colours win over the hover pre-highlight. */
+static HGDIOBJ GripBrush(int index,BOOL hover)
+{
+    CadId id=model.vertices[index].id;
+    return id==selected && hotBrush ? (HGDIOBJ)hotBrush : id==selected2 && secondBrush ? (HGDIOBJ)secondBrush :
+        hover && preBrush ? (HGDIOBJ)preBrush : GetStockObject(WHITE_BRUSH);
+}
+/* The model scene in canvas coordinates (origin 0,0, clipped by the
+ * caller): everything except the overlays (ViewCube, Home, navigation bar,
+ * hovered grip), so hover feedback never needs a scene render. */
+static void RenderScene(HDC dc)
 {
     RECT r;
-    int i,a,b,oldDC;
+    int i,a,b;
     BOOL filled = FALSE, aircraftFilled = FALSE, featureFilled = FALSE;
     HGDIOBJ oldPen,oldBrush;
     HPEN wirePen;
     CadVertex *v,*w;
-    char text[240];
     unsigned activeSketch = cad_fui_active_sketch();
-    DWORD telemetry, checksum;
-    COLORREF marker[4];
-    r.left=0; r.top=0; r.right=width; r.bottom=height;
-    FillRect(dc,&r,(HBRUSH)GetStockObject(WHITE_BRUSH));
-    DrawRibbon(dc);
-    oldDC=SaveDC(dc);
-    SetViewportOrg(dc, CANVAS_LEFT, RIBBON_HEIGHT);
-    IntersectClipRect(dc,0,0,canvasWidth,canvasHeight);
+    ++sceneRenders;
     SetBkMode(dc,TRANSPARENT);
     oldPen=SelectObject(dc,edgePen ? (HGDIOBJ)edgePen : GetStockObject(BLACK_PEN));
-    if (sheetView) DrawSheet(dc);
-    else {
+    if (sheetView) {
+        r.left=0; r.top=0; r.right=canvasWidth; r.bottom=canvasHeight;
+        FillRect(dc,&r,(HBRUSH)GetStockObject(WHITE_BRUSH));
+        DrawSheet(dc);
+    } else {
+        /* Inventor-style background: white above, banded towards silver. */
+        cad_chrome_background(dc,canvasWidth,canvasHeight);
         if (showGrid) {
             SelectObject(dc,gridPen ? (HGDIOBJ)gridPen : GetStockObject(BLACK_PEN));
             for (i=-400; i<=400; i+=50) {
@@ -1172,57 +1260,73 @@ static void Render(HDC dc)
         for (i=0; i<(int)model.vertex_count; ++i) if (visible[i]) {
             if (aircraftPresent && model.vertices[i].id != selected &&
                 model.vertices[i].id != selected2) continue;
-            SelectObject(dc,model.vertices[i].id==selected && hotBrush ? (HGDIOBJ)hotBrush :
-                model.vertices[i].id==selected2 && secondBrush ? (HGDIOBJ)secondBrush :
-                GetStockObject(WHITE_BRUSH));
+            SelectObject(dc,GripBrush(i,FALSE));
             Rectangle(dc,px[i]-GRIP,py[i]-GRIP,px[i]+GRIP+1,py[i]+GRIP+1);
         }
         SelectObject(dc,oldBrush);
         DrawConstraintGlyphs(dc);
-        if (!model.vertex_count && !cad_parts_count(&parts) && !cad_fui_count())
-            TextOut(dc,12,12,"Empty document - use Create",27);
-        DrawViewCube(dc);
+        if (!model.vertex_count && !cad_parts_count(&parts) && !cad_fui_count()) {
+            SetTextColor(dc,RGB(128,128,128));
+            TextOut(dc,12,12,emptyHint,sizeof(emptyHint)-1);
+            SetTextColor(dc,RGB(0,0,0));
+        }
     }
     SelectObject(dc,oldPen);
-    if (oldDC) RestoreDC(dc,oldDC);
-    else { SetViewportOrg(dc,0,0); SelectClipRgn(dc,NULL); }
-    r.left=0; r.top=RIBBON_HEIGHT; r.right=min(SIDE_WIDTH,width); r.bottom=RIBBON_HEIGHT+22;
-    FillRect(dc,&r,(HBRUSH)GetStockObject(LTGRAY_BRUSH));
-    TextOut(dc,4,RIBBON_HEIGHT+4,"Model browser",13);
-    r.left=0; r.top=height-STATUS_HEIGHT; r.right=width; r.bottom=height;
-    FillRect(dc,&r,(HBRUSH)GetStockObject(LTGRAY_BRUSH));
-    text[0]=0;
-    if (activeSketch) sprintf(text,"%.31s - sketch mode | ",cad_fui_name(activeSketch));
-    sprintf(text+strlen(text),"%u vertices / %u edges | %s | %s%s | V%u E%u",
-        model.vertex_count,model.edge_count,
-        model.units==CAD_UNITS_MM ? "mm" : model.units==CAD_UNITS_INCHES ? "inches" : "unspecified",
-        sheetView ? "drawing" : filled ? "shaded" : "wireframe",snap ? " / snap 10" : "",selected,selectedEdge);
-    if (selected2) sprintf(text+strlen(text)," +V%u",selected2);
-    /* Feature health early: the 640-pixel guest screen clips the tail. */
-    if (cad_fui_count()) {
-        sprintf(text+strlen(text)," | features %u",cad_fui_count());
-        if (cad_fui_errors()) sprintf(text+strlen(text)," (%u failed)",cad_fui_errors());
+    lastFilled=filled; lastFeatureFilled=featureFilled;
+}
+static void DrawGrip(HDC dc,int index,BOOL hover)
+{
+    HGDIOBJ oldPen,oldBrush;
+    if (index<0 || index>=(int)model.vertex_count || !visible[index]) return;
+    oldPen=SelectObject(dc,edgePen ? (HGDIOBJ)edgePen : GetStockObject(BLACK_PEN));
+    oldBrush=SelectObject(dc,GripBrush(index,hover));
+    Rectangle(dc,px[index]-GRIP,py[index]-GRIP,px[index]+GRIP+1,py[index]+GRIP+1);
+    SelectObject(dc,oldBrush); SelectObject(dc,oldPen);
+}
+/* Overlays on top of the scene (canvas coordinates). */
+static void DrawOverlays(HDC dc)
+{
+    if (sheetView) return;
+    if (hoverVertex>=0) DrawGrip(dc,hoverVertex,TRUE);
+    DrawViewCube(dc);
+    cad_chrome_home(dc,canvasWidth,canvasHeight,navHot==ID_VIEW_HOME);
+    cad_chrome_nav(dc,canvasWidth,canvasHeight,navHot,navMode);
+}
+/* Paints the window. The scene is rendered into the cache bitmap only when
+ * InvalidateScene marked it stale; exposures (menus, dialogs, overlapping
+ * windows) just blit it. Without GDI memory for the cache every paint
+ * renders directly, as before. */
+static void Render(HDC dc)
+{
+    RECT r;
+    HDC cache;
+    int saved,cacheSaved,recreated;
+    DrawRibbon(dc);
+    /* Splitter column between the browser and the viewport. */
+    r.left=min(SIDE_WIDTH,width); r.top=RIBBON_HEIGHT; r.right=min(CANVAS_LEFT,width); r.bottom=height-STATUS_HEIGHT;
+    FillRect(dc,&r,(HBRUSH)GetStockObject(GRAY_BRUSH));
+    if (canvasWidth>0 && canvasHeight>0) {
+        cache=cad_chrome_scene_dc(dc,canvasWidth,canvasHeight,&recreated);
+        if (recreated) sceneValid=FALSE;
+        saved=SaveDC(dc);
+        SetViewportOrg(dc,CANVAS_LEFT,RIBBON_HEIGHT);
+        IntersectClipRect(dc,0,0,canvasWidth,canvasHeight);
+        if (cache) {
+            if (!sceneValid) {
+                cacheSaved=SaveDC(cache);
+                IntersectClipRect(cache,0,0,canvasWidth,canvasHeight);
+                RenderScene(cache);
+                if (cacheSaved) RestoreDC(cache,cacheSaved);
+            }
+            BitBlt(dc,0,0,canvasWidth,canvasHeight,cache,0,0,SRCCOPY);
+        } else RenderScene(dc);
+        sceneValid=TRUE;
+        DrawOverlays(dc);
+        if (saved) RestoreDC(dc,saved);
+        else { SetViewportOrg(dc,0,0); SelectClipRgn(dc,NULL); }
     }
-    sprintf(text+strlen(text)," | fx %u | constraints %d | parts %u",cad_userparams_count(&userParams),
-        constraints.count,cad_parts_count(&parts));
-    TextOut(dc,4,height-STATUS_HEIGHT+5,text,strlen(text));
-    /* Debug-only display telemetry follows the real rendered state. It does
-     * not drive commands or modify the document. Normal launches omit it. */
-    if (uiTestMode && width > 90 && height > 4) {
-        telemetry = (DWORD)model.vertex_count | ((DWORD)model.edge_count << 9) |
-            ((DWORD)model.units << 19) | ((DWORD)(filled ? 1 : 0) << 21) |
-            ((DWORD)(Dirty() ? 1 : 0) << 22) |
-            ((DWORD)(cad_parts_count(&parts) ? 1 : 0) << 23);
-        checksum = (telemetry ^ (telemetry >> 8) ^ (telemetry >> 16) ^ 0xa7UL) & 255;
-        telemetry |= checksum << 24;
-        marker[0] = RGB(255,0,255); marker[1] = RGB(255,255,0);
-        marker[2] = RGB(0,255,255); marker[3] = RGB(255,0,255);
-        TelemetryStrip(dc, height-STATUS_HEIGHT + 1, telemetry, marker);
-        /* Second strip (features, see cad_fui_telemetry): own marker order. */
-        marker[0] = RGB(0,255,255); marker[1] = RGB(255,0,255);
-        marker[2] = RGB(255,255,0); marker[3] = RGB(0,255,255);
-        TelemetryStrip(dc, height-STATUS_HEIGHT + 3, cad_fui_telemetry(featureFilled), marker);
-    }
+    cad_chrome_browser_title(dc,RIBBON_HEIGHT,min(SIDE_WIDTH,width),BROWSER_TITLE);
+    DrawStatus(dc);
 }
 
 static int HitTest(int x,int y)
@@ -1244,11 +1348,8 @@ static void MouseMove(HWND hwnd,int x,int y)
     double du,dv,dx,dy,dz;
     CadStatus status;
     CadVcStatus vc;
-    if (!gesture) {
-        int hit = !sheetView && BuildViewCube() ? cad_cube_hit(&viewCube,x,y) : CAD_CUBE_NONE;
-        if (cubeHover != hit) { cubeHover = hit; InvalidateRect(hwnd,NULL,FALSE); }
-        return;
-    }
+    /* Hover (ViewCube, ribbon, grips) is ChromeHover's job: never a render. */
+    if (!gesture) return;
     if (GetCapture()!=hwnd) { EndGesture(hwnd,FALSE); return; }
     if (gesture == G_CUBE) {
         if (abs(x-startMouseX)+abs(y-startMouseY) <= 3) return;
@@ -1257,6 +1358,22 @@ static void MouseMove(HWND hwnd,int x,int y)
     if (gesture==G_ORBIT) {
         yaw=(int)((startYaw+((long)x-startMouseX)/2)&255);
         pitch=(int)((startPitch+((long)y-startMouseY)/2)&255);
+    } else if (gesture==G_PAN) {
+        /* The press point stays under the cursor: move the view center by
+         * the inverse camera rotation of the screen displacement. */
+        if (scale<=0) { EndGesture(hwnd,FALSE); return; }
+        du=((double)x-startMouseX)/scale; dv=((double)startMouseY-y)/scale;
+        centerX=startCenterX-(du*ICos(yaw)/1024.0+dv*ISin(pitch)*ISin(yaw)/1048576.0);
+        centerY=startCenterY-dv*ICos(pitch)/1024.0;
+        centerZ=startCenterZ-(du*ISin(yaw)/1024.0-dv*ISin(pitch)*ICos(yaw)/1048576.0);
+    } else if (gesture==G_ZOOM) {
+        /* Drag up zooms in: 100 pixels doubles / halves the scale. */
+        du=((double)startMouseY-y)/100.0;
+        scale=startScale*(du>=0 ? 1.0+du : 1.0/(1.0-du));
+        if (scale<0.001) scale=0.001;
+        if (scale>8.0) scale=8.0;
+        focal=(long)(scale*1024.0); if (focal<1) focal=1;
+        scale=focal/1024.0;
     } else {
         if (dragScale<=0 || VertexIndex(dragTarget)<0) { EndGesture(hwnd,FALSE); return; }
         du=((double)x-startMouseX)/dragScale;
@@ -1283,7 +1400,7 @@ static void MouseMove(HWND hwnd,int x,int y)
             vc=vcFailure; EndGesture(hwnd,FALSE); vcFailure=vc; ModelResult(hwnd,status); return;
         }
     }
-    InvalidateRect(hwnd,NULL,FALSE);
+    InvalidateScene(hwnd);
 }
 
 /* Initialized statics are NEAR (DGROUP) throughout this module: Watcom
@@ -1721,7 +1838,7 @@ BOOL FAR PASCAL __export ParametersDlg(HWND dlg,UINT msg,WPARAM wp,LPARAM lp)
     if (status!=CAD_UP_OK) { ParamError(dlg,&error); return TRUE; }
     /* Associativity: features using the parameter resize right away. */
     cad_fui_regenerate();
-    InvalidateRect(GetParent(dlg),NULL,FALSE);
+    InvalidateScene(GetParent(dlg));
     FillParamList(dlg,id);
     if (wp!=IDC_PARAM_MODIFY) {
         SetDlgItemText(dlg,IDC_PARAM_NAME,""); SetDlgItemText(dlg,IDC_PARAM_EXPR,"");
@@ -2034,6 +2151,8 @@ static void RunMacro(HWND hwnd)
             "CAD",MB_OK | MB_ICONINFORMATION);
 }
 
+/* Chrome-only repaints (defined with the hover code below). */
+static void RepaintChrome(HWND hwnd);
 static void Command(HWND hwnd,int command)
 {
     char path[PATH_BYTES],message[200];
@@ -2120,7 +2239,13 @@ static void Command(HWND hwnd,int command)
         CreateOrProperties(hwnd,command); return;
     case ID_CREATE_LINE: case ID_CREATE_RECTANGLE: case ID_CREATE_BOX: case ID_CREATE_EXTRUDE:
         CreateOrProperties(hwnd,command); return;
-    case ID_VIEW_ORBIT: sheetView=FALSE; break;
+    /* Navigation bar modes: left-drag orbits / pans / zooms until toggled
+     * off or Esc. Right-drag always orbits. */
+    case ID_VIEW_ORBIT: case ID_VIEW_PAN: case ID_VIEW_ZOOM:
+        navMode=navMode==command ? 0 : command;
+        if (sheetView) { sheetView=FALSE; break; }
+        UpdateUI(hwnd); RepaintChrome(hwnd); return;
+    case ID_VIEW_HOME: yaw=32; pitch=24; sheetView=FALSE; Fit(); break;
     case ID_VIEW_FRONT: yaw=0; pitch=0; sheetView=FALSE; Fit(); break;
     case ID_VIEW_TOP: yaw=0; pitch=64; sheetView=FALSE; Fit(); break;
     case ID_VIEW_SIDE: yaw=64; pitch=0; sheetView=FALSE; Fit(); break;
@@ -2132,7 +2257,11 @@ static void Command(HWND hwnd,int command)
     case ID_VIEW_SHADED:
         if (AircraftTopology() || cad_fui_output()->face_count) shaded = TRUE;
         sheetView = FALSE; break;
-    case ID_TOOLS_SNAP: snap=!snap; break;
+    /* Toggles and tabs that leave the scene alone repaint chrome only. */
+    case ID_TOOLS_SNAP: snap=!snap; UpdateUI(hwnd); RepaintChrome(hwnd); return;
+    case ID_RIBBON_TAB0: case ID_RIBBON_TAB0+1: case ID_RIBBON_TAB0+2:
+    case ID_RIBBON_TAB0+3: case ID_RIBBON_TAB0+4: case ID_RIBBON_TAB5:
+        ribbonTab=command-ID_RIBBON_TAB0; UpdateUI(hwnd); RepaintChrome(hwnd); return;
     case ID_TOOLS_TEST_STATUS: uiTestMode = TRUE; break;
     case ID_TOOLS_MM: case ID_TOOLS_UNSPECIFIED:
         /* Parameter units switch first (fail-atomic) so a table that uses
@@ -2167,6 +2296,7 @@ static BOOL Key(HWND hwnd,WPARAM key)
     int i;
     if (key==VK_ESCAPE) {
         if (gesture) EndGesture(hwnd,FALSE);
+        else if (navMode) { navMode=0; UpdateUI(hwnd); RepaintChrome(hwnd); }
         else {
             selected=selectedEdge=selected2=0; selectedConstraint=0; selectedComponent=0;
             selectedFeature=0; selectedProfile=-1; Changed(hwnd);
@@ -2195,11 +2325,184 @@ static BOOL Key(HWND hwnd,WPARAM key)
     status=MoveSelected(v.x,v.y,v.z); ModelResult(hwnd,status); Changed(hwnd); return TRUE;
 }
 
+/* Browser subclass: Esc/Tab/PgUp/PgDn go to the editor; a click on a +/-
+ * expander and Right/Left (or +/-) on a folder row expand/collapse it. */
 LRESULT FAR PASCAL __export BrowserProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 {
+    int row;
     if (msg==WM_KEYDOWN && (wp==VK_ESCAPE || wp==VK_TAB || wp==VK_PRIOR || wp==VK_NEXT))
         return SendMessage(GetParent(hwnd),msg,wp,lp);
+    if (msg==WM_KEYDOWN && (wp==VK_RIGHT || wp==VK_LEFT || wp==VK_ADD || wp==VK_SUBTRACT)) {
+        row=(int)SendMessage(hwnd,LB_GETCURSEL,0,0);
+        if (row>=0 && (cad_chrome_tree_flags(row) & CHROME_TREE_FOLDER)) {
+            ToggleFolder(row,wp==VK_RIGHT || wp==VK_ADD); return 0;
+        }
+    }
+    if (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK) {
+        row=(int)SendMessage(hwnd,LB_GETTOPINDEX,0,0)+(int)HIWORD(lp)/CHROME_ROW_HEIGHT;
+        if (row<(int)SendMessage(hwnd,LB_GETCOUNT,0,0) && cad_chrome_tree_expander(row,(int)LOWORD(lp))) {
+            ToggleFolder(row,-1); return 0;
+        }
+    }
     return CallWindowProc((FARPROC)oldBrowserProc,hwnd,msg,wp,lp);
+}
+/* ---- Hover feedback: never a scene render ----
+ * Everything below paints straight into a window DC and touches only the
+ * pixels that changed: ribbon buttons, the tab row, ViewCube faces (same
+ * geometry, new fill: exact), the opaque navigation bar, the Home button and
+ * grips (scene pixels restored from the cache bitmap), and the status bar. */
+static int BeginCanvas(HDC dc)
+{
+    int saved=SaveDC(dc);
+    SetViewportOrg(dc,CANVAS_LEFT,RIBBON_HEIGHT);
+    IntersectClipRect(dc,0,0,canvasWidth,canvasHeight);
+    return saved;
+}
+static void EndCanvas(HDC dc,int saved)
+{
+    if (saved) RestoreDC(dc,saved);
+    else { SetViewportOrg(dc,0,0); SelectClipRgn(dc,NULL); }
+}
+/* Copies scene pixels (canvas coordinates) back from the cache. */
+static BOOL RestoreScene(HDC dc,const RECT *r)
+{
+    HDC cache=sceneValid ? cad_chrome_scene_cached() : NULL;
+    if (!cache) return FALSE;
+    BitBlt(dc,r->left,r->top,r->right-r->left,r->bottom-r->top,cache,r->left,r->top,SRCCOPY);
+    return TRUE;
+}
+static BOOL NearOverlay(int index)
+{
+    return index>=0 && index<(int)model.vertex_count && visible[index] &&
+        px[index]+GRIP>=canvasWidth-180 && py[index]-GRIP<240;
+}
+static void PaintHover(HWND hwnd,int oldRibbon,int oldNav,int oldVertex,int oldCube)
+{
+    HDC dc=GetDC(hwnd);
+    RECT r;
+    int saved;
+    BOOL overlays;
+    if (!dc) return;
+    if (oldRibbon!=ribbonHot)
+        cad_chrome_ribbon_items(dc,width,ribbonTab,GetMenu(hwnd),ribbonHot,ribbonPressed,oldRibbon,ribbonHot);
+    if (!sheetView && canvasWidth>0 && canvasHeight>0) {
+        saved=BeginCanvas(dc);
+        overlays=FALSE;
+        if (oldVertex!=hoverVertex) {
+            /* The old grip: cached scene pixels, else its normal (opaque) grip. */
+            if (oldVertex>=0 && oldVertex<(int)model.vertex_count && visible[oldVertex]) {
+                r.left=px[oldVertex]-GRIP; r.top=py[oldVertex]-GRIP;
+                r.right=px[oldVertex]+GRIP+1; r.bottom=py[oldVertex]+GRIP+1;
+                if (!RestoreScene(dc,&r)) DrawGrip(dc,oldVertex,FALSE);
+            }
+            DrawGrip(dc,hoverVertex,TRUE);
+            overlays=NearOverlay(oldVertex) || NearOverlay(hoverVertex);
+        }
+        if (overlays || oldCube!=cubeHover) DrawViewCube(dc);
+        if (overlays || ((oldNav==ID_VIEW_HOME) != (navHot==ID_VIEW_HOME))) {
+            cad_chrome_home_rect(canvasWidth,canvasHeight,&r);
+            if (!RestoreScene(dc,&r)) FillRect(dc,&r,(HBRUSH)GetStockObject(WHITE_BRUSH));
+            cad_chrome_home(dc,canvasWidth,canvasHeight,navHot==ID_VIEW_HOME);
+        }
+        if (overlays || oldNav!=navHot) cad_chrome_nav(dc,canvasWidth,canvasHeight,navHot,navMode);
+        EndCanvas(dc,saved);
+    }
+    DrawStatus(dc);
+    ReleaseDC(hwnd,dc);
+}
+/* Mode/tab/toggle changes that leave the scene alone: ribbon, navigation
+ * bar and status only. */
+static void RepaintChrome(HWND hwnd)
+{
+    HDC dc=GetDC(hwnd);
+    int saved;
+    if (!dc) return;
+    DrawRibbon(dc);
+    if (!sheetView && canvasWidth>0 && canvasHeight>0) {
+        saved=BeginCanvas(dc);
+        cad_chrome_nav(dc,canvasWidth,canvasHeight,navHot,navMode);
+        EndCanvas(dc,saved);
+    }
+    DrawStatus(dc);
+    ReleaseDC(hwnd,dc);
+}
+/* Pressed-state changes: only the two ribbon items involved. */
+static void RibbonItemsNow(HWND hwnd,int a,int b)
+{
+    HDC dc=GetDC(hwnd);
+    if (!dc) return;
+    cad_chrome_ribbon_items(dc,width,ribbonTab,GetMenu(hwnd),ribbonHot,ribbonPressed,a,b);
+    DrawStatus(dc);
+    ReleaseDC(hwnd,dc);
+}
+static void SetHover(HWND hwnd,int ribbon,int nav,int vertex,int cube)
+{
+    int oldRibbon=ribbonHot,oldNav=navHot,oldVertex=hoverVertex,oldCube=cubeHover;
+    if (ribbon==ribbonHot && nav==navHot && vertex==hoverVertex && cube==cubeHover) return;
+    ribbonHot=ribbon; navHot=nav; hoverVertex=vertex; cubeHover=cube;
+    PaintHover(hwnd,oldRibbon,oldNav,oldVertex,oldCube);
+}
+/* HitTest against the projection of the last paint: no floating point per
+ * mouse move. Stale for at most one frame after a change (Changed repaints). */
+static int HoverTest(int x,int y)
+{
+    int i,best=-1;
+    long dx,dy,distance,bestDistance=PICK*PICK+1;
+    for (i=0; i<(int)model.vertex_count; ++i) if (visible[i]) {
+        dx=(long)x-px[i]; dy=(long)y-py[i];
+        if (dx < -PICK || dx > PICK || dy < -PICK || dy > PICK) continue;
+        distance=dx*dx+dy*dy;
+        if (distance<bestDistance) { best=i; bestDistance=distance; }
+    }
+    return best;
+}
+static void ChromeHover(HWND hwnd,int x,int y)
+{
+    int ribbon=0,nav=0,vertex=-1,cube=CAD_CUBE_NONE,cx=x-CANVAS_LEFT,cy=y-RIBBON_HEIGHT;
+    if (y>=0 && y<RIBBON_HEIGHT) ribbon=cad_chrome_ribbon_hit(x,y,width,ribbonTab);
+    else if (!sheetView && cx>=0 && cy>=0 && cx<canvasWidth && cy<canvasHeight) {
+        if (BuildViewCube()) cube=cad_cube_hit(&viewCube,cx,cy);
+        if (cube==CAD_CUBE_NONE) nav=cad_chrome_nav_hit(cx,cy,canvasWidth,canvasHeight);
+        /* Pre-highlight vertex grips (the 747 demo draws no grips). */
+        if (cube==CAD_CUBE_NONE && !nav && !aircraftPresent && !navMode) vertex=HoverTest(cx,cy);
+    }
+    if (ribbon && ribbon<CHROME_HIT_TAB && !cad_chrome_enabled(GetMenu(hwnd),ribbon)) ribbon=0;
+    SetHover(hwnd,ribbon,nav,vertex,cube);
+}
+static void RepaintRibbon(HWND hwnd)
+{
+    HDC dc=GetDC(hwnd);
+    if (!dc) return;
+    DrawRibbon(dc); DrawStatus(dc);
+    ReleaseDC(hwnd,dc);
+}
+/* What the viewport highlights: a browser selection change re-renders the
+ * scene only if one of these changed (constraint picks, folder rows: chrome). */
+typedef struct ShownSelection { CadId vertex, second, edge; CadAssemblyId component; unsigned feature; } ShownSelection;
+static void TakeSelection(ShownSelection *s)
+{
+    s->vertex=selected; s->second=selected2; s->edge=selectedEdge;
+    s->component=selectedComponent; s->feature=selectedFeature;
+}
+static void ShowSelection(HWND hwnd,const ShownSelection *before)
+{
+    UpdateUI(hwnd);
+    if (before->vertex!=selected || before->second!=selected2 || before->edge!=selectedEdge ||
+        before->component!=selectedComponent || before->feature!=selectedFeature) InvalidateScene(hwnd);
+    else RepaintChrome(hwnd);
+}
+/* Inventor's File button opens the classic File menu as a popup. */
+static void FileMenu(HWND hwnd)
+{
+    POINT point;
+    HMENU menu=GetMenu(hwnd);
+    if (!menu || !GetSubMenu(menu,0)) return;
+    UpdateUI(hwnd);
+    cad_chrome_file_anchor(&point);
+    ClientToScreen(hwnd,&point);
+    ribbonPressed=CHROME_HIT_FILE; RibbonItemsNow(hwnd,CHROME_HIT_FILE,0);
+    TrackPopupMenu(GetSubMenu(menu,0),0,point.x,point.y,0,hwnd,NULL);
+    ribbonPressed=0; ribbonHot=0; RibbonItemsNow(hwnd,CHROME_HIT_FILE,0);
 }
 LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 {
@@ -2208,13 +2511,18 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     int x=(int)LOWORD(lp),y=(int)HIWORD(lp),index,row;
     DWORD data;
     CadStatus status;
+    ShownSelection shown;
     switch (msg) {
     case WM_CREATE:
+        mainWindow=hwnd;
+        cad_chrome_init(instance);
         browser=CreateWindow("LISTBOX","",WS_CHILD | WS_VISIBLE | WS_BORDER |
-            WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-            0,RIBBON_HEIGHT+22,SIDE_WIDTH,100,hwnd,(HMENU)IDC_BROWSER,instance,NULL);
+            WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+            LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            0,RIBBON_HEIGHT+BROWSER_TITLE,SIDE_WIDTH,100,hwnd,(HMENU)IDC_BROWSER,instance,NULL);
         if (!browser) return -1;
-        SendMessage(browser,LB_SETHORIZONTALEXTENT,600,0);
+        SendMessage(browser,WM_SETFONT,(WPARAM)GetStockObject(ANSI_VAR_FONT),0);
+        SendMessage(browser,LB_SETHORIZONTALEXTENT,420,0);
         browserThunk=MakeProcInstance((FARPROC)BrowserProc,instance);
         if (browserThunk) {
             oldBrowserProc=(WNDPROC)GetWindowLong(browser,GWL_WNDPROC);
@@ -2229,28 +2537,48 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         dimPen=CreatePen(PS_SOLID,1,RGB(170,170,170));
         hotBrush=CreateSolidBrush(RGB(255,64,64));
         secondBrush=CreateSolidBrush(RGB(255,170,0));
+        preBrush=CreateSolidBrush(RGB(0,255,255));
         captureTimer=SetTimer(hwnd,TIMER_CAPTURE,80,NULL)!=0;
         Changed(hwnd); return 0;
     case WM_SIZE:
         EndGesture(hwnd,FALSE);
         width=max(0,x); height=max(0,y);
         canvasWidth=max(0,width-CANVAS_LEFT); canvasHeight=max(0,height-STATUS_HEIGHT-RIBBON_HEIGHT);
-        MoveWindow(browser,0,RIBBON_HEIGHT+22,min(width,SIDE_WIDTH),max(0,canvasHeight-22),TRUE);
-        Fit(); InvalidateRect(hwnd,NULL,TRUE); return 0;
+        MoveWindow(browser,0,RIBBON_HEIGHT+BROWSER_TITLE,min(width,SIDE_WIDTH),max(0,canvasHeight-BROWSER_TITLE),TRUE);
+        Fit(); InvalidateScene(hwnd); return 0;
     case WM_PAINT:
         dc=BeginPaint(hwnd,&ps); Render(dc); EndPaint(hwnd,&ps); return 0;
     case WM_ERASEBKGND: return 1;
+    /* Windows 3.0 leaves wParam unused here: identify the control by CtlID. */
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT FAR *)lp)->CtlID==IDC_BROWSER) {
+            ((MEASUREITEMSTRUCT FAR *)lp)->itemHeight=CHROME_ROW_HEIGHT; return TRUE;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT FAR *)lp)->CtlID==IDC_BROWSER) {
+            cad_chrome_tree_draw((const DRAWITEMSTRUCT FAR *)lp); return TRUE;
+        }
+        break;
     case WM_KEYDOWN: if (Key(hwnd,wp)) return 0; break;
     case WM_LBUTTONDOWN:
         if (y >= 0 && y < RIBBON_HEIGHT && !gesture) {
-            row = RibbonHit(x, y);
-            if (row >= 10000) { ribbonTab = row - 10000; InvalidateRect(hwnd,NULL,FALSE); }
-            else if (row) Command(hwnd, row);
+            /* Ribbon buttons act on release over the same button. */
+            row = cad_chrome_ribbon_hit(x, y, width, ribbonTab);
+            if (row == CHROME_HIT_FILE) FileMenu(hwnd);
+            else if (row >= CHROME_HIT_TAB && row < CHROME_HIT_TAB + CHROME_TABS) {
+                ribbonTab = row - CHROME_HIT_TAB; UpdateUI(hwnd); RepaintRibbon(hwnd);
+            } else if (row && cad_chrome_enabled(GetMenu(hwnd), row)) {
+                index = ribbonHot;
+                ribbonPressed = ribbonHot = row; SetCapture(hwnd); RibbonItemsNow(hwnd, index, row);
+            }
             return 0;
         }
         x -= CANVAS_LEFT; y -= RIBBON_HEIGHT;
         if (gesture && GetCapture()!=hwnd) EndGesture(hwnd,FALSE);
         if (gesture || sheetView) return 0;
+        row = cad_chrome_nav_hit(x, y, canvasWidth, canvasHeight);
+        if (row) { SetFocus(hwnd); Command(hwnd, row); return 0; }
         if (BuildViewCube()) {
             row = cad_cube_hit(&viewCube,x,y);
             if (row != CAD_CUBE_NONE && captureTimer) {
@@ -2261,6 +2589,15 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 if (GetCapture()!=hwnd) EndGesture(hwnd,FALSE);
                 return 0;
             }
+        }
+        /* Navigation bar modes take the left button over the whole view. */
+        if (navMode && captureTimer && x>=0 && y>=0 && x<canvasWidth && y<canvasHeight) {
+            SetFocus(hwnd); startMouseX=x; startMouseY=y; startYaw=yaw; startPitch=pitch;
+            startCenterX=centerX; startCenterY=centerY; startCenterZ=centerZ; startScale=scale;
+            gesture=navMode==ID_VIEW_PAN ? G_PAN : navMode==ID_VIEW_ZOOM ? G_ZOOM : G_ORBIT;
+            SetCapture(hwnd);
+            if (GetCapture()!=hwnd) EndGesture(hwnd,FALSE);
+            return 0;
         }
         SetFocus(hwnd); index=HitTest(x,y); selectedEdge=0; selectedConstraint=0; selectedComponent=0;
         selectedFeature=0; selectedProfile=-1;
@@ -2290,20 +2627,46 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         gesture=G_ORBIT; SetCapture(hwnd);
         if (GetCapture()!=hwnd) EndGesture(hwnd,FALSE);
         return 0;
-    case WM_MOUSEMOVE: MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); return 0;
+    case WM_MOUSEMOVE:
+        if (!gesture) ChromeHover(hwnd,x,y);
+        MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); return 0;
     case WM_LBUTTONUP:
+        if (ribbonPressed) {
+            row = ribbonPressed; ribbonPressed = 0;
+            if (GetCapture()==hwnd) ReleaseCapture();
+            index = cad_chrome_ribbon_hit(x, y, width, ribbonTab);
+            RibbonItemsNow(hwnd, row, 0);
+            if (index == row) Command(hwnd, row);
+            return 0;
+        }
         if (gesture == G_CUBE) {
             if (GetCapture()!=hwnd) { EndGesture(hwnd,FALSE); return 0; }
             MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT);
             if (gesture == G_CUBE) { row = cubePending; EndGesture(hwnd,TRUE); NavigateCube(hwnd,row); return 0; }
         }
-        if (gesture==G_ORBIT) { MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); EndGesture(hwnd,TRUE); return 0; }
+        if (gesture==G_ORBIT || gesture==G_PAN || gesture==G_ZOOM) {
+            MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); EndGesture(hwnd,TRUE); return 0;
+        }
         if (gesture==G_GRIP) { MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); EndGesture(hwnd,TRUE); } return 0;
     case WM_RBUTTONUP:
         if (gesture==G_ORBIT) { MouseMove(hwnd,x-CANVAS_LEFT,y-RIBBON_HEIGHT); EndGesture(hwnd,TRUE); } return 0;
     case WM_TIMER:
-        if (gesture && GetCapture()!=hwnd) EndGesture(hwnd,FALSE); return 0;
+        if (gesture && GetCapture()!=hwnd) EndGesture(hwnd,FALSE);
+        if (ribbonPressed && GetCapture()!=hwnd) { row=ribbonPressed; ribbonPressed=0; RibbonItemsNow(hwnd,row,0); }
+        /* No WM_MOUSELEAVE in Windows 3.1: drop hover once the cursor is
+         * over another window (browser, dialog, desktop). */
+        if (!gesture && !ribbonPressed && (ribbonHot || navHot || hoverVertex>=0 || cubeHover!=CAD_CUBE_NONE)) {
+            POINT point;
+            GetCursorPos(&point);
+            if (WindowFromPoint(point)!=hwnd) SetHover(hwnd,0,0,-1,CAD_CUBE_NONE);
+        }
+        return 0;
     case WM_CANCELMODE: case WM_KILLFOCUS:
+        if (ribbonPressed) {
+            row=ribbonPressed; ribbonPressed=0;
+            if (GetCapture()==hwnd) ReleaseCapture();
+            RibbonItemsNow(hwnd,row,0);
+        }
         EndGesture(hwnd,FALSE); return 0;
     case WM_ACTIVATE:
         if (wp==WA_INACTIVE) EndGesture(hwnd,FALSE); break;
@@ -2314,16 +2677,22 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     case WM_COMMAND:
         if (wp==IDC_BROWSER) {
             EndGesture(hwnd,FALSE);
+            TakeSelection(&shown);
             if (HIWORD(lp)==LBN_SELCHANGE || HIWORD(lp)==LBN_DBLCLK) {
                 row=(int)SendMessage(browser,LB_GETCURSEL,0,0);
                 if (row<0) return 0;
                 data=(DWORD)SendMessage(browser,LB_GETITEMDATA,row,0);
-                if (data==BROWSER_HEADER) return 0;
+                /* Folders and origin entries: double-click expands/collapses. */
+                if (data&BROWSER_HEADER) {
+                    if (HIWORD(lp)==LBN_DBLCLK && (cad_chrome_tree_flags(row)&CHROME_TREE_FOLDER))
+                        ToggleFolder(row,-1);
+                    return 0;
+                }
                 if ((data&BROWSER_FEATURE) && !(data&(BROWSER_COMPONENT|BROWSER_CONSTRAINT))) {
                     selected=selectedEdge=selected2=0; selectedConstraint=0; selectedComponent=0;
                     selectedFeature=(unsigned)(data&0xFFFFUL);
                     selectedProfile=(int)((data>>16)&0xFFUL)-1;
-                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                    ShowSelection(hwnd,&shown);
                     if (HIWORD(lp)==LBN_DBLCLK) Command(hwnd,ID_FEATURE_EDIT);
                     return 0;
                 }
@@ -2331,7 +2700,7 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 if (data&BROWSER_COMPONENT) {
                     selected=selectedEdge=selected2=0; selectedConstraint=0;
                     selectedComponent=(CadAssemblyId)(data&~BROWSER_COMPONENT);
-                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                    ShowSelection(hwnd,&shown);
                     if (HIWORD(lp)==LBN_DBLCLK) Command(hwnd,ID_INSERT_MOVE);
                     return 0;
                 }
@@ -2339,7 +2708,7 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 if (data&BROWSER_CONSTRAINT) {
                     selected=selectedEdge=selected2=0;
                     selectedConstraint=(CadVcId)(data&~BROWSER_CONSTRAINT);
-                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                    ShowSelection(hwnd,&shown);
                     if (HIWORD(lp)==LBN_DBLCLK) Command(hwnd,ID_CONSTRAIN_DISTANCE);
                     return 0;
                 }
@@ -2347,12 +2716,12 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 if (!(data&BROWSER_EDGE) && selected && (CadId)data!=selected &&
                     (GetKeyState(VK_CONTROL)<0 || GetKeyState(VK_SHIFT)<0)) {
                     selected2=(CadId)data; SyncBrowser();
-                    UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE); return 0;
+                    ShowSelection(hwnd,&shown); return 0;
                 }
                 selected2=0;
                 selected=(data&BROWSER_EDGE) ? 0 : (CadId)data;
                 selectedEdge=(data&BROWSER_EDGE) ? (CadId)data : 0;
-                UpdateUI(hwnd); InvalidateRect(hwnd,NULL,FALSE);
+                ShowSelection(hwnd,&shown);
                 if (HIWORD(lp)==LBN_DBLCLK && selected) Command(hwnd,ID_EDIT_PROPERTIES);
             }
             return 0;
@@ -2375,6 +2744,8 @@ LRESULT FAR PASCAL __export MainWndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         if (activePen) DeleteObject(activePen);
         if (dimPen) DeleteObject(dimPen);
         cad_fui_free_brushes();
+        cad_chrome_free();
+        if (preBrush) DeleteObject(preBrush);
         if (hotBrush) DeleteObject(hotBrush);
         if (secondBrush) DeleteObject(secondBrush);
         for (index = 0; index < CAD_AIRCRAFT_MATERIAL_COUNT * 8; ++index)

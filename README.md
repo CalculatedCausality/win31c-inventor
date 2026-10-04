@@ -4,11 +4,31 @@ An Inventor-style CAD application written in C for **Windows 3.1 (Win16, 80286)*
 cross-compiled on Linux/WSL with Open Watcom and run in the
 [PCjs](https://www.pcjs.org/) IBM PC AT emulator.
 
-![Boeing 747 demo with ViewCube](docs/screenshot.png)
+![Inventor-style ribbon, model browser, ViewCube and navigation bar](docs/screenshot.png)
 
 ## Features
 
-- Ribbon (3D Model / Sketch / View), model browser and ViewCube with orbit ring
+- Inventor-style window chrome at 640x480 in 16 colours (`cad_chrome.c`):
+  - Ribbon with a blue **File** button (opens the File menu), tabs *3D Model, Sketch,
+    Assemble, Constrain, Manage, View*, captioned panels of 32x32 large and stacked
+    16x16 small buttons, hover/pressed/checked/disabled states, Undo/Redo quick access
+    and a status-bar prompt for the button under the mouse. Starting a sketch switches
+    to the Sketch tab; *Finish Sketch* returns to 3D Model. The classic menu bar stays
+    (keyboard access); *View > Ribbon tab* selects tabs from the keyboard
+  - Model browser tree: *Part1* root with a collapsed *Origin* folder, features and
+    profiles with icons, *End of Part*, then *Constraints*, *Components* and a
+    collapsed *Wireframe* folder (vertices/edges). Click +/-, double-click, or
+    Right/Left on a folder row expands/collapses it; errors show red with a (!) icon,
+    blocked/suppressed features grey
+  - Viewport: white-to-grey-blue banded background, ViewCube with orbit ring, Home
+    button and a navigation bar (Pan, Zoom, Orbit as left-drag modes - Esc ends them -
+    and Zoom All); vertex grips pre-highlight under the mouse
+  - Status bar: prompt/help at the left, document counts at the right
+  - Rendering on a 286: the scene is rendered into a cached viewport bitmap only
+    when geometry, camera, view mode, selection or the document change; menus,
+    dialogs and other exposures just blit it (direct rendering if GDI memory is
+    short). Hover feedback (ribbon, ViewCube, Home, navigation bar, grips, status
+    help) repaints only the affected pixels and never renders the scene
 - Lines, XY rectangles, boxes and polygon extrusions with stable entity IDs
 - Vertex grips (drag, snap, numeric properties), transactional undo/redo
 - Versioned, CRC-checked `.CAD` documents with recoverable saves
@@ -72,7 +92,10 @@ and run `A:\CAD.EXE` from Program Manager's File > Run.
 sh tests/run.sh                                   # host unit tests (C89, sanitizers)
 sh tests/win16-check.sh                           # Watcom Win16 compile checks
 python3 debug/test_generic_ui.py --windows --hold # visible end-to-end test in Edge
+python3 debug/test_generic_ui.py                  # same test, headless (server: ./launch-debug.sh --server-only)
 ```
+
+The headless run also saves every ribbon tab as `out/ui-tests/chrome-*.png`.
 
 The end-to-end test drives the real Windows 3.1 guest, reading results from OCR and
 a checksummed pixel strip that CAD.EXE draws in `/UITEST` mode.
@@ -84,6 +107,8 @@ a checksummed pixel strip that CAD.EXE draws in `/UITEST` mode.
 | `cad.c`, `cad.rc`, `cad_ui_ids.h` | Win16 front end |
 | `cad_*.c/h` | Portable C89 modules (model, documents, export, drawing, sketch, params, constraints, assembly, features, aircraft, mesh view, ViewCube) |
 | `cad_featureui.c/h` | Feature-tree glue for CAD.EXE: storage, dialogs, browser rows, persistence |
+| `cad_chrome.c/h` | Win16 window chrome for CAD.EXE: ribbon, browser tree rows, navigation bar, background, status bar |
+| `res/icons/`, `tools/make_icons.py` | 16-colour ribbon/browser bitmaps (generated) |
 | `debug/` | Local PCjs harness, server and browser tests |
 | `tests/` | Host tests and Win16 compile checks |
 | `house.c`, `stars.c`, `wallgen.c` | Earlier experiments |

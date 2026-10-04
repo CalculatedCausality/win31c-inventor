@@ -42,3 +42,6 @@ printf 'Win16 compile: cad_features + features_test (large model) PASS\n'
 # --- featureui (large model, Windows dialogs included via __WINDOWS__) ---
 "$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_featureui.obj" "$root/cad_featureui.c"
 printf 'Win16 compile: cad_featureui (large model) PASS\n'
+# --- chrome (CAD.EXE ribbon/browser/navigation drawing; Win16 GDI only) ---
+"$WATCOM/binl64/wcc" -q -bt=windows -zW -ml -zt=1 -2 -ox -w4 -we -fr "-fo=$scratch/cad_chrome.obj" "$root/cad_chrome.c"
+printf 'Win16 compile: cad_chrome (large model) PASS\n'

@@ -2,7 +2,9 @@
 import unittest
 from PIL import Image, ImageDraw, ImageFont
 from test_cad_ui import recognize, red_geometry, white_fraction
-from test_generic_ui import rendered_state, feature_state, STATE_MAGIC, FEATURE_MAGIC
+from test_generic_ui import (rendered_state, feature_state, STATE_MAGIC, FEATURE_MAGIC, surface_pixels,
+                             geometry_box, feature_pixels, CANVAS_TOP, SILVER,
+                             render_state, RENDER_MAGIC)
 
 
 class OracleTests(unittest.TestCase):
@@ -69,6 +71,50 @@ class OracleTests(unittest.TestCase):
         strip(475, FEATURE_MAGIC, feature, 0xa7)
         self.assertIsNone(feature_state(image))
         self.assertIsNotNone(rendered_state(image))
+
+    def test_gradient_background_is_not_surface(self):
+        """The dithered white/silver viewport gradient and silver grid lines
+        must not count as shaded surface; real faces still do."""
+        image = Image.new('RGB', (640, 480), (252, 252, 252))
+        pixels = image.load()
+        assert pixels is not None
+        for y in range(CANVAS_TOP + 150, 456):
+            for x in range(155, 640):
+                if (x + y) % 3 == 0:
+                    pixels[x, y] = SILVER
+        self.assertEqual(surface_pixels(image), 0)
+        ImageDraw.Draw(image).rectangle((250, 250, 349, 299), fill=(132, 136, 140))
+        self.assertEqual(surface_pixels(image), 100 * 50)
+
+    def test_viewport_chrome_is_not_geometry(self):
+        """ViewCube, Home button and navigation bar pixels never count as
+        model geometry; a line in the free viewport does."""
+        image = Image.new('RGB', (640, 480), (252, 252, 252))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((640 - 130, CANVAS_TOP + 8, 640 - 10, CANVAS_TOP + 128), outline='black')
+        draw.rectangle((640 - 174, CANVAS_TOP + 8, 640 - 144, CANVAS_TOP + 38), fill='black')
+        draw.rectangle((640 - 30, CANVAS_TOP + 140, 640 - 6, CANVAS_TOP + 230), fill='black')
+        self.assertIsNone(geometry_box(image))
+        self.assertEqual(feature_pixels(image), 0)
+        draw.line((200, 300, 299, 300), fill='black')
+        self.assertEqual(geometry_box(image), (100, 1))
+        self.assertEqual(feature_pixels(image), 100)
+
+    def test_render_strip_is_separate_and_checksummed(self):
+        image = Image.new('RGB', (640, 480), 'white')
+        pixels = image.load()
+        assert pixels is not None
+        payload = 1234 | (1 << 16)
+        checksum = (payload ^ (payload >> 8) ^ (payload >> 16) ^ 0x3e) & 255
+        encoded = payload | (checksum << 24)
+        colors = list(RENDER_MAGIC) + [(255, 255, 255) if encoded & (1 << b) else (0, 0, 0) for b in range(32)]
+        for y in (465, 466):
+            for index, color in enumerate(colors):
+                pixels[6 + index * 2, y] = color
+        self.assertEqual(render_state(image), {'renders': 1234, 'cached': True, 'pending': False})
+        self.assertIsNone(rendered_state(image))
+        pixels[14, 465] = pixels[14, 466] = (0, 0, 0) if encoded & 1 else (255, 255, 255)
+        self.assertIsNone(render_state(image))
 
     def test_dialog_occlusion_is_not_a_successful_edit(self):
         original = Image.new('RGB', (400, 300), 'black')

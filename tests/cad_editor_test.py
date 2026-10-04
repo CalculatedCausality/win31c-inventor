@@ -97,12 +97,33 @@ static void (*dialogHook)(int id);
 #define IDD_PARAMETERS_SHIM 0
 static HWND GetCapture(void) { return capture; }
 static void ReleaseCapture(void) { capture=0; }
-static void InvalidateRect(HWND h,void *r,BOOL e) { (void)h;(void)r;(void)e; }
+/* Paint model: every invalidation is followed by WM_PAINT, which renders
+ * the scene only if InvalidateScene marked the cache stale. */
+static BOOL sceneValid;
+static int invalidations, sceneRenderCount, hoverPaints, chromeRepaints;
+static void InvalidateRect(HWND h,void *r,BOOL e)
+{ (void)h;(void)r;(void)e; ++invalidations; if (!sceneValid) { ++sceneRenderCount; sceneValid=1; } }
+static void InvalidateScene(HWND hwnd);
+/* Window chrome stand-ins (real hit tests are Win16-only; geometry here is
+ * a fixed fake layout: tab row, ribbon buttons, navigation bar). */
+#define CHROME_HIT_TAB 10000
+typedef int HMENU;
+static HMENU GetMenu(HWND h) { (void)h; return 1; }
+static int cad_chrome_enabled(HMENU m,int c) { (void)m; return c!=ID_EDIT_DELETE; }
+static int cad_chrome_ribbon_hit(int x,int y,int w,int tab)
+{ (void)w;(void)tab; if (y<22) return x>=50 && x<120 ? CHROME_HIT_TAB+1 : 0;
+  return y>=24 && y<76 && x<300 ? (x<150 ? ID_FEATURE_EXTRUDE : ID_EDIT_DELETE) : 0; }
+static int cad_chrome_nav_hit(int x,int y,int w,int h)
+{ (void)h; if (x>=w-30 && x<w-6 && y>=142 && y<230) return ID_VIEW_PAN+(y-142)/22%3;
+  return x>=w-176 && x<w-142 && y>=6 && y<40 ? ID_VIEW_HOME : 0; }
+static void PaintHover(HWND h,int a,int b,int c,int d) { (void)h;(void)a;(void)b;(void)c;(void)d; ++hoverPaints; }
+static void RepaintChrome(HWND h) { (void)h; ++chromeRepaints; }
+static void ShowPending(HWND h) { (void)h; }
 static int MessageBox(HWND h,const char *s,const char *t,int f)
 { (void)h;(void)t;(void)f; if (strncmp(s,"Save changes",12)) { ++errors; strncpy(lastMessage,s,511); } return answer; }
 static void SyncConstraints(void);
 static void SyncFeatures(void);
-static void Changed(HWND h) { (void)h; ++changes; SyncFeatures(); SyncConstraints(); }
+static void Changed(HWND h) { ++changes; SyncFeatures(); SyncConstraints(); InvalidateScene(h); }
 /* Native modal dialogs: the test presets their in/out globals. */
 static int RunDialog(HWND h,FARPROC p,int id) { (void)h;(void)p; if (dialogHook) dialogHook(id); return dialogResult; }
 static void UpdateUI(HWND h) { (void)h; }
@@ -131,7 +152,8 @@ names = ["ISin", "ICos", "VertexIndex", "MarkSaved", "Dirty", "ParseNumber",
           "FollowUnits", "UndoRedo", "ParamLookup", "RunMacro", "Command", "Key",
           "PartsText", "PartsMessage", "FitPoint", "ParseOffset", "ParseYaw",
           "ComponentSegment", "ComponentCommand", "SyncFeatures", "SketchView",
-          "FeatureCommand"]
+          "FeatureCommand", "InvalidateScene", "HoverTest", "SetHover", "ChromeHover",
+          "TakeSelection", "ShowSelection"]
 
 tests = r'''
 static void LineTo(HDC h,int x,int y)
@@ -458,6 +480,93 @@ static long TopZ(void)
     assert(cad_fui_bounds(lo,hi));
     return hi[2];
 }
+/* Window chrome controller paths: ribbon tab commands, navigation modes
+ * (pan/zoom/orbit left-drag, Esc), Home, and pan/zoom cancel restoring the
+ * exact camera. */
+static void chrome_tests(void)
+{
+    double cx,cy,cz,oldScale;
+    long oldFocal;
+    Command(1,ID_FILE_NEW);
+    assert(cad_create_box(&model,0,0,0,100,50,40)==CAD_OK);
+    canvasWidth=480; canvasHeight=320; yaw=32; pitch=24; Fit();
+    Command(1,ID_RIBBON_TAB0+3); assert(ribbonTab==3);
+    Command(1,ID_RIBBON_TAB5); assert(ribbonTab==5);
+    Command(1,ID_RIBBON_TAB0); assert(ribbonTab==0);
+    sheetView=TRUE; Command(1,ID_VIEW_PAN); assert(navMode==ID_VIEW_PAN && !sheetView);
+    Command(1,ID_VIEW_ZOOM); assert(navMode==ID_VIEW_ZOOM);
+    Command(1,ID_VIEW_ZOOM); assert(!navMode);
+    Command(1,ID_VIEW_ORBIT); assert(navMode==ID_VIEW_ORBIT);
+    assert(Key(1,VK_ESCAPE) && !navMode);
+    /* Pan: the camera-plane displacement moves the center; release keeps it. */
+    cx=centerX; cy=centerY; cz=centerZ; oldScale=scale; oldFocal=focal;
+    yaw=0; pitch=0; startMouseX=100; startMouseY=100;
+    startCenterX=cx; startCenterY=cy; startCenterZ=cz; startScale=scale;
+    gesture=G_PAN; capture=1; MouseMove(1,100+(int)(10*scale+0.5),100);
+    assert(centerX<cx-9.0 && centerX>cx-11.0 && centerY==cy && centerZ==cz);
+    EndGesture(1,TRUE); assert(!gesture && centerX<cx-9.0);
+    /* Pan cancel restores the center. */
+    cx=centerX; startCenterX=cx; startCenterY=centerY; startCenterZ=centerZ;
+    gesture=G_PAN; capture=1; MouseMove(1,100,150); assert(centerY!=startCenterY);
+    EndGesture(1,FALSE); assert(centerX==cx && centerY==startCenterY && centerZ==startCenterZ);
+    /* Zoom: drag up 100 px doubles, down 100 px halves; cancel restores. */
+    startScale=oldScale; gesture=G_ZOOM; capture=1; MouseMove(1,100,0);
+    assert(scale>oldScale*1.99 && scale<oldScale*2.01 && focal>=1);
+    MouseMove(1,100,200); assert(scale>oldScale*0.49 && scale<oldScale*0.51);
+    EndGesture(1,FALSE); assert(scale==oldScale && focal==oldFocal);
+    gesture=G_ZOOM; capture=1; MouseMove(1,100,-10000); assert(scale<=8.0);
+    EndGesture(1,TRUE); assert(scale<=8.0 && focal==(long)(scale*1024.0));
+    /* Home: isometric and zoom all. */
+    yaw=0; pitch=64; sheetView=TRUE; Command(1,ID_VIEW_HOME);
+    assert(yaw==32 && pitch==24 && !sheetView);
+    Command(1,ID_FILE_NEW);
+}
+/* Hover never renders the scene: a full sweep of the window over ribbon,
+ * tabs, ViewCube faces and ring, Home, navigation bar and vertex grips only
+ * repaints chrome. Camera changes render exactly once; tabs, navigation
+ * modes, snap and constraint picks repaint chrome only. */
+static void hover_tests(void)
+{
+    int x,y,renders,paints,sawCube=0,sawRing=0,sawNav=0,sawHome=0,sawRibbon=0,sawTab=0,sawGrip=0;
+    ShownSelection shown;
+    Command(1,ID_FILE_NEW);
+    assert(cad_create_box(&model,0,0,0,100,50,40)==CAD_OK);
+    width=640; height=440; canvasWidth=width-CANVAS_LEFT; canvasHeight=height-STATUS_HEIGHT-RIBBON_HEIGHT;
+    yaw=32; pitch=24; sheetView=FALSE; gesture=G_NONE; navMode=0; Fit(); Changed(1); Project();
+    assert(BuildViewCube() && sceneValid);
+    renders=sceneRenderCount; paints=invalidations; hoverPaints=0;
+    for (y=0; y<height; y+=2) for (x=0; x<width; x+=3) {
+        ChromeHover(1,x,y);
+        MouseMove(1,x-CANVAS_LEFT,y-RIBBON_HEIGHT);
+        sawCube|=cubeHover!=CAD_CUBE_NONE && cubeHover!=CAD_CUBE_ORBIT;
+        sawRing|=cubeHover==CAD_CUBE_ORBIT;
+        sawNav|=navHot==ID_VIEW_PAN; sawHome|=navHot==ID_VIEW_HOME;
+        sawRibbon|=ribbonHot==ID_FEATURE_EXTRUDE; sawTab|=ribbonHot==CHROME_HIT_TAB+1;
+        sawGrip|=hoverVertex>=0;
+        assert(ribbonHot!=ID_EDIT_DELETE); /* disabled buttons never highlight */
+    }
+    assert(sawCube && sawRing && sawNav && sawHome && sawRibbon && sawTab && sawGrip);
+    assert(hoverPaints>20);
+    assert(sceneRenderCount==renders && invalidations==paints);
+    /* Leaving the window (timer) clears hover without a render. */
+    SetHover(1,0,0,-1,CAD_CUBE_NONE); assert(sceneRenderCount==renders && invalidations==paints);
+    /* A camera change renders exactly once. */
+    Command(1,ID_VIEW_FRONT); assert(sceneRenderCount==renders+1); renders=sceneRenderCount;
+    /* Tabs, navigation modes, Esc and snap: chrome only. */
+    chromeRepaints=0; paints=invalidations;
+    Command(1,ID_RIBBON_TAB0+2); Command(1,ID_VIEW_PAN); Command(1,ID_VIEW_ZOOM);
+    assert(Key(1,VK_ESCAPE) && !navMode); Command(1,ID_TOOLS_SNAP); Command(1,ID_TOOLS_SNAP);
+    assert(chromeRepaints==6 && sceneRenderCount==renders && invalidations==paints);
+    /* Browser picks: a constraint pick is chrome only, a vertex pick renders. */
+    TakeSelection(&shown); selectedConstraint=7; ShowSelection(1,&shown);
+    assert(sceneRenderCount==renders && chromeRepaints==7);
+    TakeSelection(&shown); selected=model.vertices[0].id; ShowSelection(1,&shown);
+    assert(sceneRenderCount==renders+1);
+    /* Leaving sheet view via a navigation mode is a real scene change. */
+    sheetView=TRUE; Command(1,ID_VIEW_ORBIT); assert(!sheetView && sceneRenderCount==renders+2);
+    navMode=0; selectedConstraint=0; selected=0;
+    Command(1,ID_FILE_NEW);
+}
 static void feature_tests(void)
 {
     char text[260];
@@ -739,7 +848,9 @@ int main(void)
     integration_tests();
     parts_tests();
     feature_tests();
-    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands, components, part features passed");
+    chrome_tests();
+    hover_tests();
+    puts("cad editor: parsing, exact dirty tracking, 500-preview drag, cancel/capture, stable IDs, keyboard, clipping, file/demo commands, components, part features, navigation/ribbon commands, render-free hover passed");
     return 0;
 }
 '''
@@ -748,6 +859,7 @@ with tempfile.TemporaryDirectory(prefix="cad-editor-") as temp:
     temp = Path(temp)
     c = temp / "controller.c"
     sheet_type = source[source.index("typedef struct SheetContext"):source.index("static int SheetLine")]
+    sheet_type += source[source.index("typedef struct ShownSelection"):source.index("static void TakeSelection")]
     (temp / "TABLE.CMD").write_bytes((root / "examples" / "TABLE.CMD").read_bytes())
     c.write_text('#define TABLE_PATH "TABLE.CMD"\n' + shim + defines + globals_ + sheet_type +
                  "".join(function(n) for n in sorted(names, key=position)) + tests)

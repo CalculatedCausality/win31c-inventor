@@ -72,7 +72,7 @@ BEGIN
     END
     POPUP "&View"
     BEGIN
-        MENUITEM "&Orbit (right-drag)", ID_VIEW_ORBIT
+        MENUITEM "&Orbit (left/right-drag)", ID_VIEW_ORBIT
         MENUITEM "&Front", ID_VIEW_FRONT
         MENUITEM "&Top", ID_VIEW_TOP
         MENUITEM "&Side", ID_VIEW_SIDE
@@ -80,6 +80,18 @@ BEGIN
         MENUITEM "&Drawing sheet", ID_VIEW_DRAWING
         MENUITEM "&Grid", ID_VIEW_GRID
         MENUITEM "&Zoom all (fit)", ID_VIEW_FIT
+        MENUITEM "Hom&e view", ID_VIEW_HOME
+        MENUITEM "&Pan (left-drag)", ID_VIEW_PAN
+        MENUITEM "Zoo&m (left-drag)", ID_VIEW_ZOOM
+        POPUP "&Ribbon tab"
+        BEGIN
+            MENUITEM "&1 3D Model", ID_RIBBON_TAB0
+            MENUITEM "&2 Sketch", 321
+            MENUITEM "&3 Assemble", 322
+            MENUITEM "&4 Constrain", 323
+            MENUITEM "&5 Manage", 324
+            MENUITEM "&6 View", ID_RIBBON_TAB5
+        END
         MENUITEM SEPARATOR
         MENUITEM "&Wireframe", ID_VIEW_WIREFRAME
         MENUITEM "S&haded", ID_VIEW_SHADED
@@ -271,3 +283,6 @@ BEGIN
     DEFPUSHBUTTON "OK", IDOK, 86, 40, 50, 14
     PUSHBUTTON "Cancel", IDCANCEL, 142, 40, 50, 14
 END
+
+/* Ribbon, navigation bar and browser icons (IDB_* from res/icon_ids.h). */
+#include "res/icons.rc"
