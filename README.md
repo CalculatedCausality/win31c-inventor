@@ -1,4 +1,4 @@
-# win31c — CAD for Windows 3.1
+# win31c - CAD for Windows 3.1
 
 An Inventor-style CAD application written in C for **Windows 3.1 (Win16, 80286)**,
 cross-compiled on Linux/WSL with Open Watcom and run in the
